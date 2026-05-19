@@ -2,7 +2,8 @@ data/
 checkpoints/
 figures/
 __pycache__/
+logs/
 *.out
 *.err
-s*.pt
-logs/
+*.pt
+*.ssh
