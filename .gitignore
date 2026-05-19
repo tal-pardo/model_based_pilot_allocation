@@ -7,3 +7,5 @@ logs/
 *.err
 *.pt
 *.ssh
+*.json
+*.png
