@@ -8,6 +8,7 @@ Phase 1: full dataset cache + train() on CUDA.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -44,6 +45,11 @@ DATA_DIR = Path("data/cnn_pilot_scorer")
 CHECKPOINT_DIR = Path("checkpoints")
 BEST_CHECKPOINT_PATH = CHECKPOINT_DIR / "model_a_phase1_best.pt"
 METRICS_PATH = CHECKPOINT_DIR / "model_a_phase1_metrics.json"
+SWEEP_DIR = CHECKPOINT_DIR / "sweep"
+SWEEP_RESULTS_CSV = SWEEP_DIR / "results.csv"
+SWEEP_WINNERS_YAML = SWEEP_DIR / "winners.yaml"
+DEFAULT_MODEL_WIDTH = 64
+DEFAULT_MODEL_DEPTH = 3
 GEN_LOG_INTERVAL = 500
 
 
@@ -74,6 +80,77 @@ class Phase1TrainConfig:
     early_stop_patience: int = 8
     lr: float = 1e-3
     weight_decay: float = 1e-4
+    width: int = DEFAULT_MODEL_WIDTH
+    depth: int = DEFAULT_MODEL_DEPTH
+    max_train_label_sc: Optional[int] = None
+
+
+@dataclass
+class SweepTrainConfig(Phase1TrainConfig):
+    """Faster early-stop defaults for hyperparameter sweep runs."""
+
+    max_epochs: int = 35
+    min_epochs: int = 5
+    early_stop_patience: int = 5
+
+
+@dataclass
+class ModelArchConfig:
+    width: int = DEFAULT_MODEL_WIDTH
+    depth: int = DEFAULT_MODEL_DEPTH
+    n_feature_channels: int = NUM_FEATURE_CHANNELS
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ModelArchConfig":
+        return cls(
+            width=int(d.get("width", DEFAULT_MODEL_WIDTH)),
+            depth=int(d.get("depth", DEFAULT_MODEL_DEPTH)),
+            n_feature_channels=int(d.get("n_feature_channels", NUM_FEATURE_CHANNELS)),
+        )
+
+
+@dataclass
+class SweepRunSpec:
+    run_id: str
+    stage: str
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    batch_size: int = 128
+    width: int = DEFAULT_MODEL_WIDTH
+    depth: int = DEFAULT_MODEL_DEPTH
+    huber_delta: float = 1.0
+    max_train_label_sc: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SweepRunSpec":
+        max_sc = d.get("max_train_label_sc")
+        return cls(
+            run_id=str(d["run_id"]),
+            stage=str(d.get("stage", "?")),
+            lr=float(d.get("lr", 1e-3)),
+            weight_decay=float(d.get("weight_decay", 1e-4)),
+            batch_size=int(d.get("batch_size", 128)),
+            width=int(d.get("width", DEFAULT_MODEL_WIDTH)),
+            depth=int(d.get("depth", DEFAULT_MODEL_DEPTH)),
+            huber_delta=float(d.get("huber_delta", 1.0)),
+            max_train_label_sc=None if max_sc is None else int(max_sc),
+        )
+
+    def to_phase1(self) -> SweepTrainConfig:
+        return SweepTrainConfig(
+            batch_size=self.batch_size,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            width=self.width,
+            depth=self.depth,
+            max_train_label_sc=self.max_train_label_sc,
+        )
+
+    def to_train_cfg(self, device: str) -> TrainConfig:
+        return TrainConfig(device=device, huber_delta=self.huber_delta)
 
 
 def resolve_device(device_str: str) -> torch.device:
@@ -376,30 +453,64 @@ def build_minibatch(
     return x, y, m
 
 
+def group_norm_groups(width: int) -> int:
+    """Pick num_groups for GroupNorm so channels divide evenly."""
+    for g in (8, 4, 2, 1):
+        if width % g == 0:
+            return g
+    return 1
+
+
+def _conv_gn_gelu(
+    in_ch: int, out_ch: int, kernel_size: int, *, num_groups: int
+) -> nn.Sequential:
+    pad = kernel_size // 2
+    return nn.Sequential(
+        nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, bias=False),
+        nn.GroupNorm(num_groups, out_ch),
+        nn.GELU(),
+    )
+
+
 class PilotScorerModelA(nn.Module):
-    """1D CNN over subcarriers: (B, 7, Nc) -> (B, Nc)."""
+    """1D CNN over subcarriers: (B, C_feat, Nc) -> (B, Nc)."""
 
     def __init__(
         self,
         n_subcarriers: int = 32,
         n_feature_channels: int = NUM_FEATURE_CHANNELS,
+        width: int = DEFAULT_MODEL_WIDTH,
+        depth: int = DEFAULT_MODEL_DEPTH,
     ) -> None:
         super().__init__()
+        if depth < 2:
+            raise ValueError(f"depth must be >= 2, got {depth}")
         self.n_subcarriers = n_subcarriers
         self.n_feature_channels = n_feature_channels
-        self.net = nn.Sequential(
-            nn.Conv1d(n_feature_channels, 64, kernel_size=5, padding=2, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv1d(64, 64, kernel_size=5, padding=2, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv1d(64, 32, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(32, 1, kernel_size=1),
+        self.width = width
+        self.depth = depth
+        gn_groups = group_norm_groups(width)
+
+        kernel_sizes = [5, 5] + [3] * max(0, depth - 2)
+        layers: List[nn.Module] = []
+        in_ch = n_feature_channels
+        for k in kernel_sizes:
+            layers.append(_conv_gn_gelu(in_ch, width, k, num_groups=gn_groups))
+            in_ch = width
+        layers.extend(
+            [
+                nn.Conv1d(width, 32, kernel_size=1),
+                nn.GELU(),
+                nn.Conv1d(32, 1, kernel_size=1),
+            ]
+        )
+        self.net = nn.Sequential(*layers)
+
+    def arch_config(self) -> ModelArchConfig:
+        return ModelArchConfig(
+            width=self.width,
+            depth=self.depth,
+            n_feature_channels=self.n_feature_channels,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -468,26 +579,29 @@ def dataset_meta(
     return meta
 
 
+# Fields that define cached X / y_label / loss_mask. Excludes training-only knobs
+# (e.g. huber_delta) that do not affect dataset generation.
+CACHE_DATASET_META_KEYS = (
+    "n_antennas",
+    "n_subcarriers",
+    "rho_space",
+    "sigma2",
+    "initial_pilot_subcarriers",
+    "final_pilot_subcarriers",
+    "pilots_added_per_step",
+    "n_cov_mc",
+    "seed",
+    "dtype",
+    "label_eps",
+    "split",
+    "n_channels",
+    "n_snapshots",
+    "n_feature_channels",
+)
+
+
 def meta_matches(cache_meta: Dict[str, Any], expected: Dict[str, Any]) -> bool:
-    keys = (
-        "n_antennas",
-        "n_subcarriers",
-        "rho_space",
-        "sigma2",
-        "initial_pilot_subcarriers",
-        "final_pilot_subcarriers",
-        "pilots_added_per_step",
-        "n_cov_mc",
-        "seed",
-        "dtype",
-        "huber_delta",
-        "label_eps",
-        "split",
-        "n_channels",
-        "n_snapshots",
-        "n_feature_channels",
-    )
-    return all(cache_meta.get(k) == expected.get(k) for k in keys)
+    return all(cache_meta.get(k) == expected.get(k) for k in CACHE_DATASET_META_KEYS)
 
 
 def dataset_path(split: SplitName) -> Path:
@@ -636,6 +750,67 @@ def ensure_datasets(
     return train_bundle, val_bundle
 
 
+def load_cached_datasets(
+    cfg: TrainConfig,
+    *,
+    train_channels: int = TRAIN_CHANNELS,
+    val_channels: int = VAL_CHANNELS,
+    verbose: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load train/val caches only; raise if missing or dataset meta mismatch.
+
+    Training-only cfg fields (e.g. huber_delta) may differ from cache meta.
+    """
+    train_expected = dataset_meta(cfg, "train", n_channels=train_channels)
+    val_expected = dataset_meta(cfg, "val", n_channels=val_channels)
+    train_bundle = load_dataset("train")
+    val_bundle = load_dataset("val")
+    if not meta_matches(train_bundle["meta"], train_expected):
+        raise RuntimeError(
+            f"Train cache meta mismatch at {dataset_path('train')}. "
+            "Rebuild with Phase 1 train or fix hyperparameters."
+        )
+    if not meta_matches(val_bundle["meta"], val_expected):
+        raise RuntimeError(
+            f"Val cache meta mismatch at {dataset_path('val')}. "
+            "Rebuild with Phase 1 train or fix hyperparameters."
+        )
+    if verbose:
+        print(f"cache: {dataset_path('train')} (hit)", flush=True)
+        print(f"cache: {dataset_path('val')} (hit)", flush=True)
+    return train_bundle, val_bundle
+
+
+def make_snapshot_loaders(
+    train_bundle: Dict[str, Any],
+    val_bundle: Dict[str, Any],
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[DataLoader, DataLoader]:
+    train_ds = PilotSnapshotDataset(
+        train_bundle["X"], train_bundle["y_label"], train_bundle["loss_mask"]
+    )
+    val_ds = PilotSnapshotDataset(
+        val_bundle["X"], val_bundle["y_label"], val_bundle["loss_mask"]
+    )
+    pin = device.type == "cuda"
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=pin,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin,
+    )
+    return train_loader, val_loader
+
+
 class PilotSnapshotDataset(Dataset):
     def __init__(self, X: torch.Tensor, y_label: torch.Tensor, loss_mask: torch.Tensor) -> None:
         if X.shape[0] != y_label.shape[0] or X.shape[0] != loss_mask.shape[0]:
@@ -649,6 +824,24 @@ class PilotSnapshotDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.X[idx], self.y_label[idx], self.loss_mask[idx]
+
+
+def subsample_train_label_mask(
+    loss_mask: torch.Tensor,
+    max_train_label_sc: Optional[int],
+) -> torch.Tensor:
+    """Random subset of unused subcarriers for training loss only."""
+    if max_train_label_sc is None:
+        return loss_mask
+    out = torch.zeros_like(loss_mask)
+    for b in range(loss_mask.shape[0]):
+        unused = (loss_mask[b] > 0.5).nonzero(as_tuple=True)[0]
+        if unused.numel() == 0:
+            continue
+        n_pick = min(int(max_train_label_sc), int(unused.numel()))
+        perm = unused[torch.randperm(unused.numel(), device=unused.device)[:n_pick]]
+        out[b, perm] = 1.0
+    return out
 
 
 @torch.no_grad()
@@ -677,6 +870,7 @@ def run_loader_epoch(
     *,
     train: bool,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    max_train_label_sc: Optional[int] = None,
 ) -> Tuple[float, float]:
     if train:
         model.train()
@@ -691,12 +885,13 @@ def run_loader_epoch(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         m = m.to(device, non_blocking=True)
+        m_loss = subsample_train_label_mask(m, max_train_label_sc) if train else m
 
         if train and optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
         pred = model(x)
-        loss = masked_huber_loss(pred, y, m, cfg.huber_delta)
+        loss = masked_huber_loss(pred, y, m_loss, cfg.huber_delta)
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite {'train' if train else 'val'} loss: {loss.item()}")
 
@@ -728,6 +923,7 @@ def save_checkpoint(
         {
             "model_state_dict": model.state_dict(),
             "cfg": config_to_meta(cfg),
+            "model_arch": model.arch_config().to_dict(),
             "best_epoch": best_epoch,
             "best_val_huber": best_val_huber,
             "best_val_top1": best_val_top1,
@@ -736,13 +932,8 @@ def save_checkpoint(
     )
 
 
-def load_checkpoint(
-    path: Path,
-    device: torch.device,
-) -> Tuple[PilotScorerModelA, TrainConfig, Dict[str, Any]]:
-    payload = torch.load(path, map_location=device, weights_only=False)
-    cfg_dict = payload["cfg"]
-    cfg = TrainConfig(
+def train_cfg_from_meta(cfg_dict: Dict[str, Any]) -> TrainConfig:
+    return TrainConfig(
         n_antennas=cfg_dict["n_antennas"],
         n_subcarriers=cfg_dict["n_subcarriers"],
         rho_space=cfg_dict["rho_space"],
@@ -756,7 +947,22 @@ def load_checkpoint(
         huber_delta=cfg_dict["huber_delta"],
         label_eps=cfg_dict["label_eps"],
     )
-    model = PilotScorerModelA(n_subcarriers=cfg.n_subcarriers).to(device)
+
+
+def load_checkpoint(
+    path: Path,
+    device: torch.device,
+) -> Tuple[PilotScorerModelA, TrainConfig, Dict[str, Any]]:
+    payload = torch.load(path, map_location=device, weights_only=False)
+    cfg_dict = payload["cfg"]
+    cfg = train_cfg_from_meta(cfg_dict)
+    arch = ModelArchConfig.from_dict(payload.get("model_arch", {}))
+    model = PilotScorerModelA(
+        n_subcarriers=cfg.n_subcarriers,
+        n_feature_channels=arch.n_feature_channels,
+        width=arch.width,
+        depth=arch.depth,
+    ).to(device)
     model.load_state_dict(payload["model_state_dict"])
     return model, cfg, payload
 
@@ -808,64 +1014,21 @@ class CNNPilotSampler:
         return int(torch.argmin(s).item())
 
 
-def train(
-    cfg: Optional[TrainConfig] = None,
-    phase1: Optional[Phase1TrainConfig] = None,
+def train_loop(
+    model: PilotScorerModelA,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: TrainConfig,
+    phase1: Phase1TrainConfig,
+    device: torch.device,
     *,
-    force_regen: bool = False,
+    checkpoint_path: Path,
+    log_prefix: str = "epoch",
+    metrics_path: Optional[Path] = None,
+    metrics_extra: Optional[Dict[str, Any]] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Phase 1: build or load cached TDL-A dataset, train PilotScorerModelA on CUDA.
-    """
-    cfg = cfg or TrainConfig()
-    phase1 = phase1 or Phase1TrainConfig()
-    device = resolve_device(cfg.device)
-
-    n_train = phase1.train_channels * n_decision_steps(cfg)
-    n_val = phase1.val_channels * n_decision_steps(cfg)
-
-    print(
-        f"phase1: device={device}  Sigma_hat n_cov_mc={cfg.n_cov_mc}  "
-        f"train={n_train} val={n_val}  batch={phase1.batch_size}",
-        flush=True,
-    )
-
-    print(f"Estimating Sigma_hat from TDL-A (n_cov_mc={cfg.n_cov_mc})...", flush=True)
-    sigma = estimate_sigma_hat_tdl_a(cfg, device)
-
-    train_bundle, val_bundle = ensure_datasets(
-        cfg,
-        sigma=sigma,
-        device=device,
-        train_channels=phase1.train_channels,
-        val_channels=phase1.val_channels,
-        force_regen=force_regen,
-        verbose=True,
-    )
-
-    train_ds = PilotSnapshotDataset(
-        train_bundle["X"], train_bundle["y_label"], train_bundle["loss_mask"]
-    )
-    val_ds = PilotSnapshotDataset(
-        val_bundle["X"], val_bundle["y_label"], val_bundle["loss_mask"]
-    )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=phase1.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=phase1.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
-
-    model = PilotScorerModelA(n_subcarriers=cfg.n_subcarriers).to(device)
+    """Shared training loop for Phase 1 and sweep runs."""
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=phase1.lr,
@@ -878,11 +1041,18 @@ def train(
     epochs_without_improve = 0
     metrics_history: List[Dict[str, Any]] = []
     val_huber_epoch1: Optional[float] = None
+    t_run0 = time.perf_counter()
 
     for epoch in range(1, phase1.max_epochs + 1):
         t0 = time.perf_counter()
         train_huber, _ = run_loader_epoch(
-            model, train_loader, cfg, device, train=True, optimizer=optimizer
+            model,
+            train_loader,
+            cfg,
+            device,
+            train=True,
+            optimizer=optimizer,
+            max_train_label_sc=phase1.max_train_label_sc,
         )
         val_huber, val_top1 = run_loader_epoch(
             model, val_loader, cfg, device, train=False, optimizer=None
@@ -899,7 +1069,7 @@ def train(
             best_epoch = epoch
             epochs_without_improve = 0
             save_checkpoint(
-                BEST_CHECKPOINT_PATH,
+                checkpoint_path,
                 model=model,
                 cfg=cfg,
                 best_epoch=best_epoch,
@@ -911,7 +1081,7 @@ def train(
 
         star = " *" if improved else ""
         print(
-            f"epoch {epoch:03d}/{phase1.max_epochs:03d}  "
+            f"{log_prefix} {epoch:03d}/{phase1.max_epochs:03d}  "
             f"train_huber={train_huber:.4f}  val_huber={val_huber:.4f}  "
             f"val_top1={val_top1:.2f}  lr={phase1.lr:.0e}  {elapsed:.1f}s{star}",
             flush=True,
@@ -934,47 +1104,445 @@ def train(
 
         if epoch >= phase1.min_epochs and epochs_without_improve >= phase1.early_stop_patience:
             print(
-                f"early stop at epoch {epoch} "
+                f"early stop at {log_prefix} {epoch} "
                 f"(no val Huber improvement for {phase1.early_stop_patience} epochs)",
                 flush=True,
             )
             break
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    with METRICS_PATH.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "cfg": config_to_meta(cfg),
-                "phase1": asdict(phase1),
-                "best_epoch": best_epoch,
-                "best_val_huber": best_val_huber,
-                "best_val_top1": best_val_top1,
-                "epochs": metrics_history,
-            },
-            f,
-            indent=2,
-        )
+    wall_sec = time.perf_counter() - t_run0
 
-    print(
-        f"phase1 done: best_val_huber={best_val_huber:.4f} @ epoch {best_epoch}  "
-        f"checkpoint={BEST_CHECKPOINT_PATH}",
-        flush=True,
-    )
-
-    if val_huber_epoch1 is not None and best_val_huber >= val_huber_epoch1:
-        print(
-            "warning: best val Huber did not improve vs epoch 1 "
-            f"({val_huber_epoch1:.4f} -> {best_val_huber:.4f})",
-            flush=True,
-        )
+    if metrics_path is not None:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "cfg": config_to_meta(cfg),
+            "phase1": asdict(phase1),
+            "model_arch": model.arch_config().to_dict(),
+            "best_epoch": best_epoch,
+            "best_val_huber": best_val_huber,
+            "best_val_top1": best_val_top1,
+            "epochs": metrics_history,
+            "wall_sec": wall_sec,
+        }
+        if metrics_extra:
+            payload.update(metrics_extra)
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
     return {
         "best_epoch": best_epoch,
         "best_val_huber": best_val_huber,
         "best_val_top1": best_val_top1,
-        "metrics_path": str(METRICS_PATH),
-        "checkpoint_path": str(BEST_CHECKPOINT_PATH),
+        "wall_sec": wall_sec,
+        "checkpoint_path": str(checkpoint_path),
+        "val_huber_epoch1": val_huber_epoch1,
     }
+
+
+def train(
+    cfg: Optional[TrainConfig] = None,
+    phase1: Optional[Phase1TrainConfig] = None,
+    *,
+    force_regen: bool = False,
+    load_cache_only: bool = False,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Phase 1: build or load cached TDL-A dataset, train PilotScorerModelA on CUDA.
+    """
+    cfg = cfg or TrainConfig()
+    phase1 = phase1 or Phase1TrainConfig()
+    device = resolve_device(cfg.device)
+
+    n_train = phase1.train_channels * n_decision_steps(cfg)
+    n_val = phase1.val_channels * n_decision_steps(cfg)
+
+    print(
+        f"phase1: device={device}  Sigma_hat n_cov_mc={cfg.n_cov_mc}  "
+        f"train={n_train} val={n_val}  batch={phase1.batch_size}  "
+        f"width={phase1.width} depth={phase1.depth}",
+        flush=True,
+    )
+
+    if load_cache_only:
+        train_bundle, val_bundle = load_cached_datasets(
+            cfg,
+            train_channels=phase1.train_channels,
+            val_channels=phase1.val_channels,
+        )
+    else:
+        print(f"Estimating Sigma_hat from TDL-A (n_cov_mc={cfg.n_cov_mc})...", flush=True)
+        sigma = estimate_sigma_hat_tdl_a(cfg, device)
+        train_bundle, val_bundle = ensure_datasets(
+            cfg,
+            sigma=sigma,
+            device=device,
+            train_channels=phase1.train_channels,
+            val_channels=phase1.val_channels,
+            force_regen=force_regen,
+            verbose=True,
+        )
+
+    train_loader, val_loader = make_snapshot_loaders(
+        train_bundle, val_bundle, phase1.batch_size, device
+    )
+
+    model = PilotScorerModelA(
+        n_subcarriers=cfg.n_subcarriers,
+        width=phase1.width,
+        depth=phase1.depth,
+    ).to(device)
+
+    result = train_loop(
+        model,
+        train_loader,
+        val_loader,
+        cfg,
+        phase1,
+        device,
+        checkpoint_path=BEST_CHECKPOINT_PATH,
+        log_prefix="epoch",
+        metrics_path=METRICS_PATH,
+        verbose=verbose,
+    )
+
+    print(
+        f"phase1 done: best_val_huber={result['best_val_huber']:.4f} @ epoch {result['best_epoch']}  "
+        f"checkpoint={BEST_CHECKPOINT_PATH}",
+        flush=True,
+    )
+
+    v1 = result.get("val_huber_epoch1")
+    if v1 is not None and result["best_val_huber"] >= v1:
+        print(
+            "warning: best val Huber did not improve vs epoch 1 "
+            f"({v1:.4f} -> {result['best_val_huber']:.4f})",
+            flush=True,
+        )
+
+    result["metrics_path"] = str(METRICS_PATH)
+    return result
+
+
+def load_sweep_config_line(config_path: Path, index: int) -> SweepRunSpec:
+    lines = [
+        ln.strip()
+        for ln in config_path.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    if index < 0 or index >= len(lines):
+        raise IndexError(
+            f"Sweep index {index} out of range for {config_path} ({len(lines)} runs)."
+        )
+    return SweepRunSpec.from_dict(json.loads(lines[index]))
+
+
+def append_sweep_results_csv(row: Dict[str, Any]) -> None:
+    SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "run_id",
+        "stage",
+        "lr",
+        "weight_decay",
+        "batch_size",
+        "width",
+        "depth",
+        "huber_delta",
+        "max_train_label_sc",
+        "best_epoch",
+        "best_val_huber",
+        "best_val_top1",
+        "wall_sec",
+        "checkpoint_path",
+    ]
+    write_header = not SWEEP_RESULTS_CSV.is_file()
+    with SWEEP_RESULTS_CSV.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def run_sweep(
+    config_path: Path,
+    index: int,
+    *,
+    device_str: str = "cuda",
+    sweep_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """One hyperparameter run (SLURM array task). Loads cache only."""
+    spec = load_sweep_config_line(config_path, index)
+    cfg = spec.to_train_cfg(device_str)
+    phase1 = spec.to_phase1()
+    device = resolve_device(cfg.device)
+    out_dir = (sweep_dir or SWEEP_DIR) / spec.run_id
+    ckpt_path = out_dir / "best.pt"
+    metrics_path = out_dir / "metrics.json"
+
+    print(
+        f"sweep {spec.run_id} (stage {spec.stage}): device={device}  "
+        f"lr={spec.lr:g} wd={spec.weight_decay:g} batch={spec.batch_size}  "
+        f"width={spec.width} depth={spec.depth} huber={spec.huber_delta}  "
+        f"max_train_label_sc={spec.max_train_label_sc}",
+        flush=True,
+    )
+
+    train_bundle, val_bundle = load_cached_datasets(cfg)
+    train_loader, val_loader = make_snapshot_loaders(
+        train_bundle, val_bundle, phase1.batch_size, device
+    )
+
+    model = PilotScorerModelA(
+        n_subcarriers=cfg.n_subcarriers,
+        width=phase1.width,
+        depth=phase1.depth,
+    ).to(device)
+
+    result = train_loop(
+        model,
+        train_loader,
+        val_loader,
+        cfg,
+        phase1,
+        device,
+        checkpoint_path=ckpt_path,
+        log_prefix=f"{spec.run_id}",
+        metrics_path=metrics_path,
+        metrics_extra={"run_id": spec.run_id, "stage": spec.stage, "spec": asdict(spec)},
+        verbose=False,
+    )
+
+    row = {
+        "run_id": spec.run_id,
+        "stage": spec.stage,
+        "lr": spec.lr,
+        "weight_decay": spec.weight_decay,
+        "batch_size": spec.batch_size,
+        "width": spec.width,
+        "depth": spec.depth,
+        "huber_delta": spec.huber_delta,
+        "max_train_label_sc": spec.max_train_label_sc,
+        "best_epoch": result["best_epoch"],
+        "best_val_huber": result["best_val_huber"],
+        "best_val_top1": result["best_val_top1"],
+        "wall_sec": result["wall_sec"],
+        "checkpoint_path": str(ckpt_path),
+    }
+    append_sweep_results_csv(row)
+
+    print(
+        f"sweep {spec.run_id} done: best_val_huber={result['best_val_huber']:.4f}  "
+        f"val_top1={result['best_val_top1']:.2f} @ epoch {result['best_epoch']}  "
+        f"checkpoint={ckpt_path}",
+        flush=True,
+    )
+    return result
+
+
+def _read_sweep_results() -> List[Dict[str, Any]]:
+    if not SWEEP_RESULTS_CSV.is_file():
+        return []
+    with SWEEP_RESULTS_CSV.open(encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def pick_sweep_winner(
+    stage: str,
+    *,
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """Best run for a stage: lowest val Huber; tie-break higher val top-1."""
+    rows = [r for r in _read_sweep_results() if r.get("stage", "").upper() == stage.upper()]
+    if not rows:
+        raise RuntimeError(
+            f"No results for stage {stage!r} in {SWEEP_RESULTS_CSV}. Run the stage first."
+        )
+
+    def score(r: Dict[str, Any]) -> Tuple[float, float]:
+        huber = float(r["best_val_huber"])
+        top1 = float(r["best_val_top1"])
+        return (huber, -top1)
+
+    rows_sorted = sorted(rows, key=score)
+    best = rows_sorted[0]
+    print(
+        f"stage {stage} winner: {best['run_id']}  "
+        f"val_huber={float(best['best_val_huber']):.4f}  "
+        f"val_top1={float(best['best_val_top1']):.2f}",
+        flush=True,
+    )
+    if len(rows_sorted) > 1:
+        print("  top runs:", flush=True)
+        for r in rows_sorted[:top_k]:
+            print(
+                f"    {r['run_id']}: huber={float(r['best_val_huber']):.4f}  "
+                f"top1={float(r['best_val_top1']):.2f}",
+                flush=True,
+            )
+    return best
+
+
+def update_winners_yaml(stage: str, winner_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge stage winner into checkpoints/sweep/winners.yaml."""
+    SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+    winners: Dict[str, Any] = {}
+    if SWEEP_WINNERS_YAML.is_file():
+        text = SWEEP_WINNERS_YAML.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if v in ("null", "~", ""):
+                    winners[k] = None
+                else:
+                    try:
+                        winners[k] = json.loads(v)
+                    except json.JSONDecodeError:
+                        winners[k] = v
+
+    keys = (
+        "lr",
+        "weight_decay",
+        "batch_size",
+        "width",
+        "depth",
+        "huber_delta",
+        "max_train_label_sc",
+    )
+    for k in keys:
+        if k in winner_row and winner_row[k] not in ("", None):
+            val = winner_row[k]
+            if k == "max_train_label_sc" and (val == "" or val == "None"):
+                winners[k] = None
+            elif k in ("lr", "weight_decay", "huber_delta", "best_val_huber", "best_val_top1"):
+                winners[k] = float(val)
+            elif k in ("batch_size", "width", "depth", "best_epoch"):
+                winners[k] = int(float(val))
+            elif k == "max_train_label_sc":
+                winners[k] = int(float(val))
+            else:
+                winners[k] = val
+    winners[f"stage_{stage.lower()}_run_id"] = winner_row.get("run_id", "")
+
+    lines = ["# Sweep winners — updated by sweep-pick after each stage\n"]
+    for k, v in winners.items():
+        lines.append(f"{k}: {json.dumps(v)}\n")
+    SWEEP_WINNERS_YAML.write_text("".join(lines), encoding="utf-8")
+    return winners
+
+
+def regenerate_stage_jsonl(stage: str, winners: Dict[str, Any]) -> Path:
+    """Write next-stage jsonl from winners.yaml (after pick)."""
+    lr = float(winners.get("lr", 1e-3))
+    wd = float(winners.get("weight_decay", 1e-4))
+    batch = int(winners.get("batch_size", 128))
+    width = int(winners.get("width", 64))
+    depth = int(winners.get("depth", 3))
+    huber = float(winners.get("huber_delta", 1.0))
+    max_sc = winners.get("max_train_label_sc")
+
+    runs: List[Dict[str, Any]] = []
+    st = stage.upper()
+
+    if st == "B":
+        for i, bs in enumerate((64, 128, 256)):
+            runs.append(
+                {
+                    "run_id": f"B{i}",
+                    "stage": "B",
+                    "lr": lr,
+                    "weight_decay": wd,
+                    "batch_size": bs,
+                    "width": 64,
+                    "depth": 3,
+                    "huber_delta": 1.0,
+                    "max_train_label_sc": None,
+                }
+            )
+    elif st == "C":
+        idx = 0
+        for w in (32, 64, 128):
+            for d in (2, 3, 4):
+                runs.append(
+                    {
+                        "run_id": f"C{idx}",
+                        "stage": "C",
+                        "lr": lr,
+                        "weight_decay": wd,
+                        "batch_size": batch,
+                        "width": w,
+                        "depth": d,
+                        "huber_delta": 1.0,
+                        "max_train_label_sc": None,
+                    }
+                )
+                idx += 1
+    elif st == "D":
+        runs = [
+            {
+                "run_id": "D0",
+                "stage": "D",
+                "lr": lr,
+                "weight_decay": wd,
+                "batch_size": batch,
+                "width": width,
+                "depth": depth,
+                "huber_delta": huber,
+                "max_train_label_sc": None,
+            },
+            {
+                "run_id": "D1",
+                "stage": "D",
+                "lr": lr,
+                "weight_decay": wd,
+                "batch_size": batch,
+                "width": width,
+                "depth": depth,
+                "huber_delta": huber,
+                "max_train_label_sc": 16,
+            },
+        ]
+    elif st == "E":
+        for i, hd in enumerate((0.5, 1.0, 2.0)):
+            runs.append(
+                {
+                    "run_id": f"E{i}",
+                    "stage": "E",
+                    "lr": lr,
+                    "weight_decay": wd,
+                    "batch_size": batch,
+                    "width": width,
+                    "depth": depth,
+                    "huber_delta": hd,
+                    "max_train_label_sc": max_sc,
+                }
+            )
+    else:
+        raise ValueError(f"regenerate_stage_jsonl does not support stage {stage!r}")
+
+    path = SWEEP_DIR / f"stage_{stage.lower()}.jsonl"
+    SWEEP_DIR.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in runs:
+            f.write(json.dumps(r) + "\n")
+    print(f"wrote {path} ({len(runs)} runs)", flush=True)
+    return path
+
+
+def sweep_pick_and_regen(
+    stage: str,
+    *,
+    next_stage: Optional[str] = None,
+) -> Dict[str, Any]:
+    winner = pick_sweep_winner(stage)
+    winners = update_winners_yaml(stage, winner)
+    if next_stage:
+        regenerate_stage_jsonl(next_stage, winners)
+    return winners
 
 
 def sanity_check(
@@ -1062,17 +1630,32 @@ def parse_args() -> argparse.Namespace:
         "command",
         nargs="?",
         default="train",
-        choices=("train", "sanity"),
-        help="train: Phase 1 full dataset + train; sanity: overfit one minibatch",
+        choices=("train", "sanity", "sweep", "sweep-pick"),
+        help="train | sanity | sweep (one HP run) | sweep-pick (winner + regen next jsonl)",
     )
     parser.add_argument(
         "--force-regen",
         action="store_true",
         help="Rebuild data/cnn_pilot_scorer/{train,val}.pt even if cache exists",
     )
+    parser.add_argument(
+        "--load-cache-only",
+        action="store_true",
+        help="train: skip Sigma_hat / dataset generation; require cached .pt files",
+    )
     parser.add_argument("--epochs", type=int, default=40, help="Max training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Minibatch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
+    parser.add_argument("--width", type=int, default=DEFAULT_MODEL_WIDTH, help="CNN width")
+    parser.add_argument("--depth", type=int, default=DEFAULT_MODEL_DEPTH, help="CNN depth (>=2)")
+    parser.add_argument(
+        "--max-train-label-sc",
+        type=int,
+        default=None,
+        help="Train on random subset of unused SC labels per snapshot (val uses all)",
+    )
+    parser.add_argument("--huber-delta", type=float, default=1.0, help="Huber loss delta")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     parser.add_argument(
         "--train-channels",
@@ -1086,6 +1669,36 @@ def parse_args() -> argparse.Namespace:
         default=VAL_CHANNELS,
         help="TDL-A val channels",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(SWEEP_DIR / "stage_a.jsonl"),
+        help="Sweep: path to stage JSONL config",
+    )
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=0,
+        help="Sweep: line index in JSONL (SLURM_ARRAY_TASK_ID)",
+    )
+    parser.add_argument(
+        "--sweep-dir",
+        type=str,
+        default=str(SWEEP_DIR),
+        help="Sweep: directory for run outputs",
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="A",
+        help="sweep-pick: completed stage letter (A, B, ...)",
+    )
+    parser.add_argument(
+        "--regen-next",
+        type=str,
+        default=None,
+        help="sweep-pick: regenerate stage_X.jsonl for this letter (e.g. B after A)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Extra per-epoch logging")
     return parser.parse_args()
 
@@ -1097,15 +1710,41 @@ def main() -> None:
         sanity_check(cfg)
         return
 
-    cfg = TrainConfig(device=args.device)
+    if args.command == "sweep":
+        run_sweep(
+            Path(args.config),
+            args.index,
+            device_str=args.device,
+            sweep_dir=Path(args.sweep_dir),
+        )
+        return
+
+    if args.command == "sweep-pick":
+        sweep_pick_and_regen(
+            args.stage,
+            next_stage=args.regen_next,
+        )
+        return
+
+    cfg = TrainConfig(device=args.device, huber_delta=args.huber_delta)
     phase1 = Phase1TrainConfig(
         train_channels=args.train_channels,
         val_channels=args.val_channels,
         batch_size=args.batch_size,
         max_epochs=args.epochs,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        width=args.width,
+        depth=args.depth,
+        max_train_label_sc=args.max_train_label_sc,
     )
-    train(cfg, phase1, force_regen=args.force_regen, verbose=args.verbose)
+    train(
+        cfg,
+        phase1,
+        force_regen=args.force_regen,
+        load_cache_only=args.load_cache_only,
+        verbose=args.verbose,
+    )
 
 
 if __name__ == "__main__":
