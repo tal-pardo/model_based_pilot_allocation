@@ -1,6 +1,6 @@
 ---
 name: Phase 2 HP sweep
-overview: "Completed staged hyperparameter sweep (A–E) over cached Phase 1 TDL-A data. 30 rows in results.csv (28 unique run_id folders); inference next (E0 vs D2b). Stage F skipped."
+overview: "Completed staged hyperparameter sweep (A–E) and closed-loop TDL-A inference (fixed/active/CNN E0/CNN D2b, n_mc=50). E0 and D2b nearly identical on MSE curves; both beat fixed and approach active. Stage F skipped."
 todos:
   - id: phase1-cache
     content: Phase 1 cache + baseline (val Huber 0.0434, top-1 0.248)
@@ -19,6 +19,9 @@ todos:
     status: completed
   - id: inference
     content: Closed-loop eval E0 vs D2/D2b vs fixed/active (inference_cnn_pilot_allocator.py)
+    status: completed
+  - id: snr-train-benchmark
+    content: Train at multiple sigma2/SNR settings; closed-loop benchmark vs fixed/active per SNR
     status: pending
 isProject: false
 ---
@@ -33,7 +36,8 @@ isProject: false
 | Code (sweep infra) | Done — [`train_cnn_pilot_allocator.py`](train_cnn_pilot_allocator.py) |
 | Stages A–E | Done — see [Full results](#full-results-resultscsv) |
 | Stage F (lr refinement) | **Skipped** — `stage_f.jsonl` exists but not run; E0 already best val Huber |
-| Final model | **Not promoted yet** — compare `E0/best.pt` vs `D2b/best.pt` in closed-loop inference |
+| Closed-loop inference | **Done** — `figures/inference/models_comparison_after_sweep.png` + `.json` (`n_mc=50`) |
+| Final model | **E0 or D2b** — closed-loop curves almost overlapping; promote either (see [Inference results](#closed-loop-inference-results-tdl-a-n_mc50)) |
 | Phase 1 baseline | `best_val_huber=0.0434`, `best_val_top1≈0.248` @ epoch 14 |
 
 **Selection rule used:** lowest **best val Huber** per stage for `winners.yaml`; tie-break **val top-1**. For deploy, also compare **closed-loop TDL-A MSE** (val top-1 can disagree with Huber — see Stage C/D).
@@ -301,16 +305,58 @@ Logs: `logs/sweep-<jobid>_<taskid>.out` (and `logs/stage_*` copies if kept).
 
 ---
 
-## Next steps (post-sweep)
+## Closed-loop inference results (TDL-A, n_mc=50)
 
-1. **Closed-loop inference** — [`inference_cnn_pilot_allocator.py`](inference_cnn_pilot_allocator.py):
-   - `E0/best.pt` — best val Huber (huber 0.5, 128×4)
-   - `D2b/best.pt` or `D2/best.pt` — 128×4, huber 1.0, best top-1 on disk (~0.25)
-   - Compare vs fixed / active on held-out TDL-A (`EVAL_CHANNEL_SEED_OFFSET` in inference code)
+**Script:** [`inference_cnn_pilot_allocator.py`](inference_cnn_pilot_allocator.py) — default sweep comparison mode.  
+**Checkpoints:** `checkpoints/E0_best.pt` (huber δ=0.5, best val Huber in sweep) vs `checkpoints/D2b_best.pt` (128×4, all labels, huber δ=1.0).  
+**Artifacts:** [`figures/inference/models_comparison_after_sweep.png`](figures/inference/models_comparison_after_sweep.png), [`figures/inference/models_comparison_after_sweep.json`](figures/inference/models_comparison_after_sweep.json).
 
-2. **Promote winner** to `checkpoints/model_a_best.pt` based on **closed-loop MSE**, not val CSV alone.
+**Setup:** Same `Sigma_hat` (TDL-A, `n_cov_mc=300`), same pilot schedule; per MC trial one `h_true`, then fixed / active / CNN E0 / CNN D2b with disjoint noise seeds (`EVAL_CHANNEL_SEED_OFFSET=300_000`).
 
-3. **Do not** run full A–E again unless inference fails; optional tiny lr grid on 128×4 only if needed.
+### Offline training vs closed-loop (final time step t=6)
+
+| Policy / model | best val Huber (train) | val top-1 (train) | mean final-step MSE (inference) |
+|----------------|------------------------|-------------------|----------------------------------|
+| — | — | — | fixed **0.00311** |
+| — | — | — | active **0.00254** |
+| **E0** | **0.0419** | 0.243 | **0.001602** |
+| **D2b** | 0.0432 | **0.252** | **0.001586** |
+
+Relative gap **E0 vs D2b** at final step: **~1.0%** (0.001602 vs 0.001586) — **negligible vs MC std** (±0.00048 / ±0.00047 on last step). Curves overlap for **t ≥ 1**; both CNNs sit **below fixed** and **between fixed and active** (active still best).
+
+### Conclusion
+
+- **E0 and D2b are effectively the same pilot policy in closed-loop** despite different offline metrics (E0 wins val Huber; D2b slightly higher val top-1). Architecture is the same 128×4; main training difference is `huber_delta` (0.5 vs 1.0).
+- **Sweep validated 128×4 CNN** over Phase 1 64×3: both sweep models beat fixed clearly and approach active.
+- **Promotion:** Either `E0_best.pt` (offline winner) or `D2b_best.pt` (marginally lower final MSE, within noise) → copy to `checkpoints/model_a_best.pt`. No need to re-run A–E or Stage F for this decision.
+
+### MSE mean curve (all steps, from JSON)
+
+| t | fixed | active | cnn E0 | cnn D2b |
+|---|-------|--------|--------|---------|
+| 0 | 0.0208 | 0.0211 | 0.0199 | 0.0202 |
+| 1 | 0.0145 | 0.00564 | 0.00584 | 0.00594 |
+| 2 | 0.0124 | 0.00423 | 0.00392 | 0.00396 |
+| 3 | 0.0113 | 0.00346 | 0.00292 | 0.00294 |
+| 4 | 0.00872 | 0.00305 | 0.00230 | 0.00231 |
+| 5 | 0.00554 | 0.00279 | 0.00188 | 0.00190 |
+| 6 | 0.00311 | 0.00254 | 0.00160 | 0.00159 |
+
+---
+
+## Next steps (post-inference)
+
+1. **Promote** `E0_best.pt` or `D2b_best.pt` to `checkpoints/model_a_best.pt` (either justified; prefer **E0** if optimizing for offline val Huber consistency).
+
+2. **Optional:** `n_mc=100` rerun for tighter CIs — unlikely to separate E0 vs D2b given overlap.
+
+3. **Do not** re-run full A–E unless a new training change is made; Stage F remains optional/low value.
+
+4. **Train at different SNR (`sigma2`) and benchmark**
+   - Phase 1/2 cache and features assume **`sigma2=1e-2`** (SNR feature `log10(1/σ²)` in the 7-channel input). Each new noise level needs a **matching dataset** (`meta` includes `sigma2`) — regenerate `data/cnn_pilot_scorer/{train,val}.pt` per `sigma2` or add a dedicated cache subfolder (e.g. `data/cnn_pilot_scorer/sigma2_1e-3/`).
+   - **Train** promoted architecture (128×4, E0-style knobs: `lr=3e-4`, `wd=1e-3`, `batch=64`, `huber_delta=0.5`) at a small grid of `sigma2` values (e.g. `1e-3`, `1e-2`, `1e-1` or equivalent SNR dB targets). Sweep only `sigma2` first — no full A–E repeat unless one SNR point underperforms.
+   - **Benchmark** each checkpoint with [`inference_cnn_pilot_allocator.py`](inference_cnn_pilot_allocator.py): same TDL-A closed-loop setup (`fixed` / `active` / CNN), pass `--sigma2` to match training and eval noise; save figures under `figures/inference/` (e.g. `mse_snr_sigma2_{value}.png` + JSON).
+   - **Goal:** see whether the CNN **generalizes across SNR** or needs per-SNR models; compare CNN vs active gap as SNR changes (active also uses `sigma2` in `J(k)` scoring).
 
 ---
 
@@ -340,8 +386,9 @@ flowchart TD
   doneB --> doneC[Stage C done]
   doneC --> doneD[Stage D expanded 4 runs]
   doneD --> doneE[Stage E done]
-  doneE --> infer[Inference E0 vs D2b]
-  infer --> promote[model_a_best.pt]
+  doneE --> infer[Inference done E0≈D2b]
+  infer --> promote[model_a_best.pt E0 or D2b]
+  promote --> snr[Train + benchmark other SNR]
 ```
 
 ---

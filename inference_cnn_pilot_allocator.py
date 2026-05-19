@@ -29,7 +29,7 @@ from pilots import (
 )
 from sionna_channels import SionnaOFDMGrid
 
-from train_cnn_pilot_sampler import (
+from train_cnn_pilot_allocator import (
     BEST_CHECKPOINT_PATH,
     CNNPilotSampler,
     TrainConfig,
@@ -43,13 +43,20 @@ from train_cnn_pilot_sampler import (
 EVAL_CHANNEL_SEED_OFFSET = 300_000
 NOISE_SEED_OFFSET_FIXED = 0
 NOISE_SEED_OFFSET_ACTIVE = 10_000
-NOISE_SEED_OFFSET_CNN = 20_000
+NOISE_SEED_OFFSET_CNN_E0 = 20_000
+NOISE_SEED_OFFSET_CNN_D2 = 30_000
 DEFAULT_OUTPUT_DIR = Path("figures/inference")
+SWEEP_CHECKPOINT_E0 = Path("checkpoints/E0_best.pt")
+SWEEP_CHECKPOINT_D2 = Path("checkpoints/D2b_best.pt")
+SWEEP_COMPARISON_PNG = DEFAULT_OUTPUT_DIR / "models_comparison_after_sweep.png"
+SWEEP_COMPARISON_JSON = DEFAULT_OUTPUT_DIR / "models_comparison_after_sweep.json"
 
 
 @dataclass
 class InferenceConfig:
     checkpoint: Path = BEST_CHECKPOINT_PATH
+    checkpoint_e0: Path = SWEEP_CHECKPOINT_E0
+    checkpoint_d2: Path = SWEEP_CHECKPOINT_D2
     n_mc: int = 100
     n_cov_mc: Optional[int] = None
     seed: Optional[int] = None
@@ -154,17 +161,207 @@ def load_cnn_policy(
     return cnn, cfg, payload
 
 
-def run_tdl_a_comparison(inf_cfg: InferenceConfig) -> Dict[str, Any]:
-    device = resolve_device(inf_cfg.device)
-    checkpoint = Path(inf_cfg.checkpoint)
-    cnn, train_cfg, payload = load_cnn_policy(checkpoint, device)
-
+def _apply_inf_overrides(train_cfg: TrainConfig, inf_cfg: InferenceConfig) -> None:
     if inf_cfg.sigma2 is not None:
         train_cfg.sigma2 = inf_cfg.sigma2
     if inf_cfg.seed is not None:
         train_cfg.seed = inf_cfg.seed
     if inf_cfg.n_cov_mc is not None:
         train_cfg.n_cov_mc = inf_cfg.n_cov_mc
+
+
+def _assert_compatible_cfg(base: TrainConfig, other: TrainConfig, other_name: str) -> None:
+    keys = (
+        "n_antennas",
+        "n_subcarriers",
+        "initial_pilot_subcarriers",
+        "final_pilot_subcarriers",
+        "pilots_added_per_step",
+    )
+    for k in keys:
+        if getattr(base, k) != getattr(other, k):
+            raise ValueError(
+                f"Checkpoint {other_name} cfg.{k}={getattr(other, k)!r} "
+                f"!= reference {getattr(base, k)!r}."
+            )
+
+
+def run_sweep_models_comparison(inf_cfg: InferenceConfig) -> Dict[str, Any]:
+    """
+    Compare fixed, active, CNN E0, and CNN D2b on TDL-A (post hyperparameter sweep).
+    Saves figures/inference/models_comparison_after_sweep.png (+ JSON).
+    """
+    device = resolve_device(inf_cfg.device)
+    ckpt_e0 = Path(inf_cfg.checkpoint_e0)
+    ckpt_d2 = Path(inf_cfg.checkpoint_d2)
+
+    cnn_e0, cfg_e0, payload_e0 = load_cnn_policy(ckpt_e0, device)
+    cnn_d2, cfg_d2, payload_d2 = load_cnn_policy(ckpt_d2, device)
+    _assert_compatible_cfg(cfg_e0, cfg_d2, "D2b")
+
+    train_cfg = cfg_e0
+    _apply_inf_overrides(train_cfg, inf_cfg)
+
+    eval_seed = train_cfg.seed
+    n_mc = inf_cfg.n_mc
+    t_add = n_decision_steps(train_cfg)
+    t_steps = t_add + 1
+
+    print(
+        f"sweep comparison: E0={ckpt_e0}  D2b={ckpt_d2}  device={device}  n_mc={n_mc}  "
+        f"T={t_add}  Sigma_hat n_cov_mc={train_cfg.n_cov_mc}",
+        flush=True,
+    )
+
+    print("Estimating Sigma_hat from TDL-A...", flush=True)
+    sigma_hat = estimate_sigma_hat_tdl_a(train_cfg, device)
+    grid = SionnaOFDMGrid(fft_size=train_cfg.n_subcarriers)
+
+    sched, fixed, _ = _pilot_schedule(train_cfg, device)
+    active = ActivePilotSampler(
+        sched, T=t_add + 1, device=device, fixed=fixed, sigma2=train_cfg.sigma2
+    )
+
+    policy_names = ("fixed", "active", "cnn_e0", "cnn_d2")
+    mse_all = {p: torch.zeros((n_mc, t_steps), dtype=torch.float64) for p in policy_names}
+
+    cnn_policies = (
+        ("cnn_e0", cnn_e0, NOISE_SEED_OFFSET_CNN_E0),
+        ("cnn_d2", cnn_d2, NOISE_SEED_OFFSET_CNN_D2),
+    )
+
+    for mc in range(n_mc):
+        channel_seed = eval_seed + EVAL_CHANNEL_SEED_OFFSET + mc
+        h_true = sample_tdl_a_channel(
+            train_cfg, grid=grid, device=device, seed=channel_seed
+        )
+
+        gen_fixed = torch.Generator(device=device).manual_seed(
+            eval_seed + NOISE_SEED_OFFSET_FIXED + mc
+        )
+        emp_fixed, _ = sequential_lmmse_mse_curve(
+            sigma_hat,
+            h_true,
+            train_cfg.sigma2,
+            t_add,
+            lambda t, _P, _f=fixed: _f.vec_indices_at_step(t),
+            device=device,
+            dtype=train_cfg.dtype,
+            generator=gen_fixed,
+        )
+        mse_all["fixed"][mc] = torch.tensor(emp_fixed, dtype=torch.float64)
+
+        active.reset()
+        gen_active = torch.Generator(device=device).manual_seed(
+            eval_seed + NOISE_SEED_OFFSET_ACTIVE + mc
+        )
+        emp_active, _ = sequential_lmmse_mse_curve(
+            sigma_hat,
+            h_true,
+            train_cfg.sigma2,
+            t_add,
+            active.vec_indices_at_step,
+            device=device,
+            dtype=train_cfg.dtype,
+            generator=gen_active,
+        )
+        mse_all["active"][mc] = torch.tensor(emp_active, dtype=torch.float64)
+
+        for pname, cnn, noise_off in cnn_policies:
+            gen_cnn = torch.Generator(device=device).manual_seed(eval_seed + noise_off + mc)
+            emp_cnn = sequential_mse_curve_cnn(
+                sigma_hat,
+                h_true,
+                train_cfg,
+                cnn,
+                fixed,
+                device=device,
+                generator=gen_cnn,
+            )
+            mse_all[pname][mc] = torch.tensor(emp_cnn, dtype=torch.float64)
+
+        if (mc + 1) % max(1, n_mc // 10) == 0 or mc + 1 == n_mc:
+            print(f"  mc {mc + 1}/{n_mc}", flush=True)
+
+    curves = {p: mse_all[p].mean(dim=0) for p in policy_names}
+    curves_std = {p: mse_all[p].std(dim=0, unbiased=False) for p in policy_names}
+
+    t_axis = torch.arange(t_steps, dtype=torch.float64)
+    final = {p: curves[p][-1].item() for p in policy_names}
+    print(
+        f"final-step MSE: fixed={final['fixed']:.6f}  active={final['active']:.6f}  "
+        f"cnn_e0={final['cnn_e0']:.6f}  cnn_d2={final['cnn_d2']:.6f}",
+        flush=True,
+    )
+
+    out_dir = Path(inf_cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png_path = out_dir / "models_comparison_after_sweep.png"
+    json_path = out_dir / "models_comparison_after_sweep.json"
+
+    plot_mse_comparison(
+        t_axis,
+        curves,
+        title="TDL-A MSE: fixed vs active vs CNN E0 vs CNN D2b (after sweep)",
+        out_path=png_path,
+        show=inf_cfg.show_plot,
+        curve_styles={
+            "fixed": {"linestyle": "-", "marker": "o", "color": "C0", "label": "fixed"},
+            "active": {"linestyle": "--", "marker": "s", "color": "C1", "label": "active"},
+            "cnn_e0": {"linestyle": "-.", "marker": "^", "color": "C2", "label": "cnn E0"},
+            "cnn_d2": {"linestyle": ":", "marker": "D", "color": "C3", "label": "cnn D2b"},
+        },
+    )
+
+    results: Dict[str, Any] = {
+        "comparison": "sweep_models",
+        "checkpoints": {
+            "e0": str(ckpt_e0.resolve()),
+            "d2b": str(ckpt_d2.resolve()),
+        },
+        "n_mc": n_mc,
+        "eval_seed": eval_seed,
+        "train_cfg": {
+            "n_antennas": train_cfg.n_antennas,
+            "n_subcarriers": train_cfg.n_subcarriers,
+            "sigma2": train_cfg.sigma2,
+            "n_cov_mc": train_cfg.n_cov_mc,
+            "seed": train_cfg.seed,
+        },
+        "checkpoint_meta": {
+            "e0": {
+                "best_epoch": payload_e0.get("best_epoch"),
+                "best_val_huber": payload_e0.get("best_val_huber"),
+                "best_val_top1": payload_e0.get("best_val_top1"),
+            },
+            "d2b": {
+                "best_epoch": payload_d2.get("best_epoch"),
+                "best_val_huber": payload_d2.get("best_val_huber"),
+                "best_val_top1": payload_d2.get("best_val_top1"),
+            },
+        },
+        "t_steps": t_steps,
+        "mse_mean": {p: curves[p].tolist() for p in policy_names},
+        "mse_std": {p: curves_std[p].tolist() for p in policy_names},
+        "final_mse": final,
+        "figure_path": str(png_path.resolve()),
+    }
+
+    if inf_cfg.save_json:
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        print(f"saved: {png_path}", flush=True)
+        print(f"saved: {json_path}", flush=True)
+
+    return results
+
+
+def run_tdl_a_comparison(inf_cfg: InferenceConfig) -> Dict[str, Any]:
+    device = resolve_device(inf_cfg.device)
+    checkpoint = Path(inf_cfg.checkpoint)
+    cnn, train_cfg, payload = load_cnn_policy(checkpoint, device)
+
+    _apply_inf_overrides(train_cfg, inf_cfg)
 
     eval_seed = train_cfg.seed
     n_mc = inf_cfg.n_mc
@@ -229,7 +426,7 @@ def run_tdl_a_comparison(inf_cfg: InferenceConfig) -> Dict[str, Any]:
         mse_active[mc] = torch.tensor(emp_active, dtype=torch.float64)
 
         gen_cnn = torch.Generator(device=device).manual_seed(
-            eval_seed + NOISE_SEED_OFFSET_CNN + mc
+            eval_seed + NOISE_SEED_OFFSET_CNN_E0 + mc
         )
         emp_cnn = sequential_mse_curve_cnn(
             sigma_hat,
@@ -329,15 +526,19 @@ def plot_mse_comparison(
     title: str,
     out_path: Path,
     show: bool = True,
+    curve_styles: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> None:
-    styles = {
+    default_styles = {
         "fixed": {"linestyle": "-", "marker": "o", "color": "C0", "label": "fixed"},
         "active": {"linestyle": "--", "marker": "s", "color": "C1", "label": "active"},
         "cnn": {"linestyle": "-.", "marker": "^", "color": "C2", "label": "cnn"},
+        "cnn_e0": {"linestyle": "-.", "marker": "^", "color": "C2", "label": "cnn E0"},
+        "cnn_d2": {"linestyle": ":", "marker": "D", "color": "C3", "label": "cnn D2b"},
     }
+    styles = curve_styles or default_styles
     plt.figure(figsize=(8.4, 4.8))
     for name, mse_mean in curves.items():
-        st = styles[name]
+        st = styles.get(name, {"linestyle": "-", "marker": "o", "color": None, "label": name})
         plt.semilogy(
             t.numpy(),
             mse_mean.numpy(),
@@ -366,10 +567,27 @@ def parse_args() -> argparse.Namespace:
         description="TDL-A closed-loop MSE: fixed vs active vs CNN pilot allocation."
     )
     parser.add_argument(
+        "--single",
+        action="store_true",
+        help="Single CNN checkpoint vs fixed/active (default: sweep E0 + D2b comparison)",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         default=BEST_CHECKPOINT_PATH,
-        help="Path to model checkpoint .pt",
+        help="Path to single CNN checkpoint .pt (with --single)",
+    )
+    parser.add_argument(
+        "--checkpoint-e0",
+        type=Path,
+        default=SWEEP_CHECKPOINT_E0,
+        help="E0 checkpoint for --sweep-comparison",
+    )
+    parser.add_argument(
+        "--checkpoint-d2",
+        type=Path,
+        default=SWEEP_CHECKPOINT_D2,
+        help="D2b checkpoint for --sweep-comparison",
     )
     parser.add_argument("--n-mc", type=int, default=50, help="Monte Carlo channel trials")
     parser.add_argument(
@@ -402,6 +620,8 @@ def main() -> None:
     args = parse_args()
     inf_cfg = InferenceConfig(
         checkpoint=args.checkpoint,
+        checkpoint_e0=args.checkpoint_e0,
+        checkpoint_d2=args.checkpoint_d2,
         n_mc=args.n_mc,
         n_cov_mc=args.n_cov_mc,
         seed=args.seed,
@@ -412,7 +632,10 @@ def main() -> None:
         save_json=not args.no_json,
         show_plot=not args.no_show,
     )
-    run_tdl_a_comparison(inf_cfg)
+    if args.single:
+        run_tdl_a_comparison(inf_cfg)
+    else:
+        run_sweep_models_comparison(inf_cfg)
 
 
 if __name__ == "__main__":
