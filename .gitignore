@@ -3,6 +3,7 @@ checkpoints/
 figures/
 __pycache__/
 logs/
+tests/
 *.out
 *.err
 *.pt
