@@ -12,7 +12,12 @@ if str(_NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(_NEW_ROOT))
 
 from channel_generators.gaussian import build_sigma_kron, sample_gaussian_h
-from channel_generators.sionna import SionnaOFDMGrid, sample_tdl_a_channel, vec_from_h
+from channel_generators.sionna import (
+    SionnaOFDMGrid,
+    estimate_empirical_sigma_tdl_a,
+    sample_tdl_a_channel,
+    vec_from_h,
+)
 from config import Exp2Config
 from experiments.common import (
     make_policy,
@@ -22,7 +27,7 @@ from experiments.common import (
     run_mc_mean_full_true_lmmse_mse,
 )
 from simulation import RunTrace, run_until_threshold
-from utils import empirical_covariance, resolve_device, set_seed
+from utils import resolve_device, set_seed
 
 FAMILIES = ("gaussian", "tdl")
 POLICIES = ("fixed", "active")
@@ -79,33 +84,6 @@ def _sample_mc_channels(
         )
         h_tdl.append(vec_from_h(h_mat))
     return h_gaussian, h_tdl
-
-
-def _estimate_sigma_hat_tdl_a(
-    cfg: Exp2Config,
-    *,
-    n_cov_mc: int,
-    seed_offset: int,
-    grid: SionnaOFDMGrid,
-    device: torch.device,
-) -> torch.Tensor:
-    """Empirical Sigma from hold-out TDL-A draws (disjoint seed block per estimate)."""
-    n = cfg.n_antennas * cfg.n_subcarriers
-    samples = torch.zeros((n_cov_mc, n), device=device, dtype=cfg.dtype)
-    for k in range(n_cov_mc):
-        h_mat = sample_tdl_a_channel(
-            n_antennas=cfg.n_antennas,
-            n_subcarriers=cfg.n_subcarriers,
-            rho_space=cfg.rho_space,
-            grid=grid,
-            device=device,
-            dtype=cfg.dtype,
-            seed=cfg.seed + seed_offset + k,
-        )
-        samples[k] = vec_from_h(h_mat).squeeze(-1)
-    return empirical_covariance(
-        samples, reg=cfg.reg_empirical, device=device, dtype=cfg.dtype
-    )
 
 
 def _run_mc_family_policy(
@@ -312,12 +290,17 @@ def run_exp2(cfg: Exp2Config) -> None:
     h_gaussian, h_tdl = _sample_mc_channels(cfg, device=device, l_space=l_space, l_freq=l_freq, grid=grid)
 
     print(f"Estimating empirical Sigma from {cfg.n_cov_mc} TDL-A draws (seed offset {COV_SEED_OFFSET_FIG2})...")
-    sigma_hat_tdl = _estimate_sigma_hat_tdl_a(
-        cfg,
+    sigma_hat_tdl = estimate_empirical_sigma_tdl_a(
+        n_antennas=cfg.n_antennas,
+        n_subcarriers=cfg.n_subcarriers,
+        rho_space=cfg.rho_space,
         n_cov_mc=cfg.n_cov_mc,
+        seed=cfg.seed,
         seed_offset=COV_SEED_OFFSET_FIG2,
+        reg_empirical=cfg.reg_empirical,
         grid=grid,
         device=device,
+        dtype=cfg.dtype,
     )
 
     h_by_family = {"gaussian": h_gaussian, "tdl": h_tdl}
@@ -354,12 +337,17 @@ def run_exp2(cfg: Exp2Config) -> None:
     sigma_by_label: dict[str, torch.Tensor] = {}
     for n_cov, seed_offset in zip(cfg.tdl_empirical_cov_sizes, COV_SEED_OFFSET_TDL_COMPARE):
         print(f"Estimating empirical Sigma from {n_cov} TDL-A draws (seed offset {seed_offset})...")
-        sigma_by_label[f"emp n={n_cov}"] = _estimate_sigma_hat_tdl_a(
-            cfg,
+        sigma_by_label[f"emp n={n_cov}"] = estimate_empirical_sigma_tdl_a(
+            n_antennas=cfg.n_antennas,
+            n_subcarriers=cfg.n_subcarriers,
+            rho_space=cfg.rho_space,
             n_cov_mc=n_cov,
+            seed=cfg.seed,
             seed_offset=seed_offset,
+            reg_empirical=cfg.reg_empirical,
             grid=grid,
             device=device,
+            dtype=cfg.dtype,
         )
 
     _run_tdl_sigma_compare_figure(

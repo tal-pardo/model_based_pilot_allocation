@@ -11,7 +11,12 @@ if str(_NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(_NEW_ROOT))
 
 from channel_generators.gaussian import build_sigma_kron, sample_gaussian_h
-from channel_generators.sionna import SionnaOFDMGrid, sample_tdl_a_channel, vec_from_h
+from channel_generators.sionna import (
+    SionnaOFDMGrid,
+    estimate_empirical_sigma_tdl_a,
+    sample_tdl_a_channel,
+    vec_from_h,
+)
 from config import Exp3Config
 from experiments.common import (
     build_exp3_curves,
@@ -22,7 +27,7 @@ from experiments.common import (
     save_exp3_tdl_figure,
 )
 from simulation import RunTrace, run_until_threshold
-from utils import empirical_covariance, resolve_device, set_seed
+from utils import resolve_device, set_seed
 
 POLICIES = ("fixed", "active")
 NOISE_SEED_OFFSET = {"fixed": 0, "active": 10_000}
@@ -67,30 +72,6 @@ def _sample_mc_channels(
         )
         h_tdl.append(vec_from_h(h_mat))
     return h_gaussian, h_tdl
-
-
-def _estimate_sigma_hat_tdl_a(
-    cfg: Exp3Config,
-    *,
-    grid: SionnaOFDMGrid,
-    device: torch.device,
-) -> torch.Tensor:
-    n = cfg.n_antennas * cfg.n_subcarriers
-    samples = torch.zeros((cfg.n_cov_mc, n), device=device, dtype=cfg.dtype)
-    for k in range(cfg.n_cov_mc):
-        h_mat = sample_tdl_a_channel(
-            n_antennas=cfg.n_antennas,
-            n_subcarriers=cfg.n_subcarriers,
-            rho_space=cfg.rho_space,
-            grid=grid,
-            device=device,
-            dtype=cfg.dtype,
-            seed=cfg.seed + COV_SEED_OFFSET + k,
-        )
-        samples[k] = vec_from_h(h_mat).squeeze(-1)
-    return empirical_covariance(
-        samples, reg=cfg.reg_empirical, device=device, dtype=cfg.dtype
-    )
 
 
 def _run_mc_policy(
@@ -169,7 +150,18 @@ def run_exp3(cfg: Exp3Config) -> None:
         f"Estimating empirical Sigma from {cfg.n_cov_mc} TDL-A draws "
         f"(seed offset {COV_SEED_OFFSET}, reg_empirical={cfg.reg_empirical:g})..."
     )
-    sigma_hat_tdl = _estimate_sigma_hat_tdl_a(cfg, grid=grid, device=device)
+    sigma_hat_tdl = estimate_empirical_sigma_tdl_a(
+        n_antennas=cfg.n_antennas,
+        n_subcarriers=cfg.n_subcarriers,
+        rho_space=cfg.rho_space,
+        n_cov_mc=cfg.n_cov_mc,
+        seed=cfg.seed,
+        seed_offset=COV_SEED_OFFSET,
+        reg_empirical=cfg.reg_empirical,
+        grid=grid,
+        device=device,
+        dtype=cfg.dtype,
+    )
 
     tdl_panels: list[tuple[str, dict, dict[str, float]]] = []
     for panel_title, sigma in (

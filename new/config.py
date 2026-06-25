@@ -51,3 +51,10 @@ class Exp3Config(ExpRunConfig):
 class Exp4Config(ExpRunConfig):
     target_pilots: Optional[int] = 16
     texture_alpha: float = 1.0
+
+
+@dataclass
+class Exp5Config(ExpRunConfig):
+    nmse_threshold: float = 0.5
+    target_pilots: Optional[int] = None
+    tdl_model: str = "A"

@@ -9,6 +9,8 @@ import torch
 from sionna.phy.channel import cir_to_ofdm_channel, exp_corr_mat, subcarrier_frequencies
 from sionna.phy.channel.tr38901 import AntennaArray, CDL, TDL
 
+from utils import empirical_covariance
+
 
 @dataclass(frozen=True)
 class SionnaOFDMGrid:
@@ -195,3 +197,36 @@ def sample_cdl_c_channel(
 def vec_from_h(h: torch.Tensor) -> torch.Tensor:
     """Input: H (Na,Nc). Output: vec(H) (N,1) column-stacked by subcarrier."""
     return h.T.contiguous().view(-1, 1)
+
+
+def estimate_empirical_sigma_tdl_a(
+    *,
+    n_antennas: int,
+    n_subcarriers: int,
+    rho_space: float,
+    n_cov_mc: int,
+    seed: int,
+    seed_offset: int,
+    reg_empirical: float,
+    grid: SionnaOFDMGrid | None = None,
+    device: torch.device,
+    dtype: torch.dtype = torch.complex64,
+) -> torch.Tensor:
+    """Input: Na, Nc, rho_space, n_cov_mc, seed+seed_offset+k per draw, reg_empirical, device.
+    Output: (N,N) Hermitian empirical covariance, N = Na*Nc."""
+    if grid is None:
+        grid = SionnaOFDMGrid(fft_size=n_subcarriers)
+    n = n_antennas * n_subcarriers
+    samples = torch.zeros((n_cov_mc, n), device=device, dtype=dtype)
+    for k in range(n_cov_mc):
+        h_mat = sample_tdl_a_channel(
+            n_antennas=n_antennas,
+            n_subcarriers=n_subcarriers,
+            rho_space=rho_space,
+            grid=grid,
+            device=device,
+            dtype=dtype,
+            seed=seed + seed_offset + k,
+        )
+        samples[k] = vec_from_h(h_mat).squeeze(-1)
+    return empirical_covariance(samples, reg=reg_empirical, device=device, dtype=dtype)
