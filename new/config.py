@@ -58,3 +58,11 @@ class Exp5Config(ExpRunConfig):
     nmse_threshold: float = 0.5
     target_pilots: Optional[int] = None
     tdl_model: str = "A"
+
+
+@dataclass
+class Exp6Config(ExpRunConfig):
+    target_pilots: Optional[int] = 32
+    rho_toeplitz: float = 0.8
+    reg_kron: float = 0.0
+    tdl_model: str = "A"

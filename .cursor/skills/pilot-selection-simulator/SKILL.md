@@ -3,7 +3,7 @@ name: pilot-selection-simulator
 description: >-
   Conventions for the incremental pilot-selection simulator in new/.
   Use when editing simulation.run_until_threshold, channel_generators,
-  channel_estimators, error_estimators, pilot policies, or experiments exp1–exp4.
+  channel_estimators, error_estimators, pilot policies, or experiments exp1–exp5.
 ---
 
 # pilot-selection-simulator
@@ -38,8 +38,9 @@ Produce `h_true` and (usually) Kronecker `Sigma`; experiments pass both into `ru
 | Module | Role | Used in |
 |--------|------|---------|
 | `gaussian.py` | `build_sigma_kron`, `sample_gaussian_h` | exp1–4 prior; exp1–3 Gaussian truth |
-| `sionna.py` | TDL-A/C, CDL-C, `vec_from_h` | exp2–3 TDL-A truth |
+| `sionna.py` | TDL-A/C, CDL-C, `vec_from_h` | exp2–5 TDL-A truth |
 | `compound_gaussian.py` | `sample_compound_gaussian_h` (Gamma texture) | exp4 |
+| `sigma_diag.py` | `build_sigma_diag_from_tdl`, `sigma_h_squared` | exp5 prior (`Σ = σ_H² I`) |
 
 Empirical `Sigma_hat` from `utils.empirical_covariance` on Sionna draws (exp2/3) is a prior choice, not a separate generator.
 
@@ -80,6 +81,7 @@ Estimate MSE without oracle `h_true` — stopping, logging, active scoring.
 | exp2 | Gaussian + TDL-A | Kronecker and/or empirical | LMMSE | trace_min | fixed / active |
 | exp3 | Gaussian + TDL-A | Kronecker and/or empirical | LMMSE | trace_min | fixed / active |
 | exp4 | Gaussian + compound-Gaussian | Kronecker (matched) | LMMSE | trace_min | fixed / active |
+| exp5 | TDL-A | diagonal `σ_H² I` from TDL tap-power sum | LMMSE | trace_min | fixed / active |
 
 When adding features, identify which layer(s) change; keep `run_until_threshold` unless deliberately extending the driver.
 
@@ -92,9 +94,9 @@ When adding features, identify which layer(s) change; keep `run_until_threshold`
 | `new/channel_estimators/` | Layer B |
 | `new/error_estimators/` | Layer C |
 | `new/pilot_policy/` | Subcarrier selection |
-| `new/config.py` | `SimConfig`, `ExpRunConfig`, `Exp1Config`–`Exp4Config` |
+| `new/config.py` | `SimConfig`, `ExpRunConfig`, `Exp1Config`–`Exp5Config` |
 | `new/utils.py` | `resolve_device`, `measure_subcarrier`, `empirical_covariance`, `empirical_nmse` |
-| `new/experiments/` | exp1–exp4, `common.py`, `vis_channels.py` |
+| `new/experiments/` | exp1–exp5, `common.py`, `vis_channels.py` |
 | `new/figures/` | Runtime PNG outputs |
 
 **Imports:** no `__init__.py`; experiment scripts prepend `new/` to `sys.path` → `from simulation import run_until_threshold`.
@@ -120,8 +122,8 @@ on cluster: conda activate model_based_pilot_allocation
 | `sigma2` | `1e-2` | AWGN variance |
 | `rho_space`, `rho_freq` | 0.8, 0.85 | Kronecker correlations |
 | `device` | `"cuda"` | fails if CUDA unavailable |
-| `nmse_threshold` | **0.1** | exp1 stop |
-| `target_pilots` | `None` (exp1) / **16** (exp2–4) | |
+| `nmse_threshold` | **0.1** (exp1) / **0.5** (exp5) | threshold stop on `tr(P)/N` |
+| `target_pilots` | `None` (exp1, exp5) / **16** (exp2–4) | |
 | `n_mc` | 50 | |
 | `n_cov_mc` | 300 | exp2/3 empirical Σ |
 | `texture_alpha` | 1.0 | exp4 compound-Gaussian |
@@ -171,6 +173,20 @@ Expected: Gaussian true≈est; TDL/Kronecker gap; TDL/empirical gap may shrink.
 
 `exp4_known_sigma.png` — 1×2: Gaussian control | compound-Gaussian (`texture_alpha`, default 1.0). Same Kronecker `Sigma` for LMMSE in both panels. Compound seeds: `seed+200_000+mc`.
 
+### exp5 — TDL-A with diagonal Σ prior
+
+`python new/experiments/exp5_diag_sigma.py` · `Exp5Config` · `exp5_diag_sigma.png`
+
+TDL-A truth + **scalar diagonal prior** `Σ = σ_H² I + reg_kron·I`, with `σ_H² = Σ_l P_l` from the fixed 3GPP TDL tap-power profile (`sigma_diag.build_sigma_diag_from_tdl`; not per-realization, not empirical). Structural mismatch: correlated TDL truth vs i.i.d. LMMSE prior (simpler than exp3 Kronecker misspecification).
+
+Fixed/active; stop `target_pilots=None`, `nmse_hat ≤ nmse_threshold` (default **0.5** on estimated MSE). Plot horizon `plot_len` from mean **estimated** curves crossing threshold. One shared MC run set for both panels. TDL channels: `seed+100_000+mc` (same as exp2/3). Noise: fixed `+0`, active `+10_000`.
+
+`exp5_diag_sigma.png` — 1×2:
+1. **Left** — mean **true** MSE for `tdl (fixed)` / `tdl (active)`; gray dotted hline at `nmse_threshold` (reference only; stopping uses est.)
+2. **Right** — active policy only: true vs est (`tr(P)/N`) + full-LMMSE true baseline (red dotted)
+
+Console: `sigma_H2`, `assert_sigma_diag` check, `mean_pilots_to_threshold` per policy, true/est gap at last plotted step. Expected: gap between true and est on right (prior mismatch); active may need fewer pilots than fixed.
+
 ### Seed offsets (summary)
 
 | Purpose | Offset |
@@ -181,7 +197,7 @@ Expected: Gaussian true≈est; TDL/Kronecker gap; TDL/empirical gap may shrink.
 | Cov (exp2 fig2, exp3) | `seed + 1_000_000 + k` |
 | Cov (exp2 fig3) | `seed + 2_000_000 + k`, `+ 3_000_000 + k` |
 | Noise fixed | `seed + 0 + mc` |
-| Noise active (exp2–4) | `seed + 10_000 + mc` |
+| Noise active (exp2–5) | `seed + 10_000 + mc` |
 | Noise random (exp1) | `seed + 10_000 + mc` |
 | Noise active (exp1) | `seed + 20_000 + mc` |
 
@@ -197,11 +213,12 @@ Same `h_true` per trial for fixed vs active; disjoint noise per policy.
 
 - **Sionna** (`sionna.py`): 15 kHz, 3.5 GHz, 100 ns delay (sim); power-normalize `H`. Experiments use **TDL-A**.
 - **Compound:** `h = sqrt(s)·g`, `s ~ Gamma(α, rate=α)`, `E[s]=1` ⇒ `E[hh^H]=Σ`.
+- **Sigma_diag** (`sigma_diag.py`): `σ_H² = sum(tap_powers)` from Sionna `TDL(...).mean_powers` (same grid/delay/carrier as `sionna.py`); `Σ = σ_H² I + reg·I`. Normalized TDL-A ⇒ `σ_H² ≈ 1`.
 
 ## Pilot policies
 
 | Policy | Rule | Exps |
 |--------|------|------|
-| fixed | uniform init + largest-gap bisection | 1–4 |
+| fixed | uniform init + largest-gap bisection | 1–5 |
 | random | uniform random unused SC | 1 only |
-| active | greedy argmax `J(k)` | 1–4 |
+| active | greedy argmax `J(k)` | 1–5 |
