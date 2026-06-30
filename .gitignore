@@ -8,5 +8,6 @@ tests/
 *.err
 *.pt
 *.ssh
+*.sbatch
 *.json
 *.png

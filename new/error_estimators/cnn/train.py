@@ -234,14 +234,18 @@ def masked_huber_loss(
     mask: torch.Tensor,
     delta: float = 1.0,
 ) -> torch.Tensor:
-    """Input: pred, target, mask (B,Nc). Output: scalar batch loss."""
+    """Input: pred, target, mask (B,Nc) 1 on SCs in loss. Output: scalar batch loss.
+
+    Mean Huber per sample over masked SCs, then mean over batch.
+    """
     residual = pred - target
     abs_r = residual.abs()
     quadratic = 0.5 * residual.pow(2)
     linear = delta * (abs_r - 0.5 * delta)
     huber = torch.where(abs_r <= delta, quadratic, linear)
-    denom = mask.sum().clamp(min=1.0)
-    return (huber * mask).sum() / denom
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    per_sample = (huber * mask).sum(dim=1) / denom
+    return per_sample.mean()
 
 
 def unused_mask_from_features(x: torch.Tensor) -> torch.Tensor:
@@ -551,16 +555,16 @@ def run_epoch(
     total_top1 = 0.0
     n_batches = 0
 
-    for x_b, y_b, m_b in loader:
+    for x_b, y_b, _m_b in loader:
         x_b = x_b.to(device)
         y_b = y_b.to(device)
-        m_b = m_b.to(device)
+        unused_mask = unused_mask_from_features(x_b)
 
         if train and optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
         pred = model(x_b)
-        loss = masked_huber_loss(pred, y_b, m_b, huber_delta)
+        loss = masked_huber_loss(pred, y_b, unused_mask, huber_delta)
 
         if train and optimizer is not None:
             loss.backward()
@@ -568,8 +572,7 @@ def run_epoch(
 
         total_loss += loss.item()
         if not train:
-            unused = unused_mask_from_features(x_b)
-            total_top1 += val_top1_unused(pred.detach(), y_b, unused)
+            total_top1 += val_top1_unused(pred.detach(), y_b, unused_mask)
         n_batches += 1
 
     return total_loss / max(n_batches, 1), total_top1 / max(n_batches, 1)
@@ -604,7 +607,7 @@ def train_loop(
 
     print(
         f"train: device={device}, train={len(x_tr)} val={len(x_va)} "
-        f"batch={cfg.batch_size}, max_\epochs={cfg.max_epochs}"
+        f"batch={cfg.batch_size}, max_\epochs={cfg.max_epochs}, loss=unused-SC Huber (per-sample mean)"
     )
 
     for epoch in range(1, cfg.max_epochs + 1):
@@ -989,21 +992,21 @@ def sanity_check(
     sigma = load_empirical_sigma(sanity_cfg, device, n_cov_mc=sanity_cfg.n_cov_mc)
 
     print("Building one minibatch from TDL-A rollouts...")
-    x, y, loss_mask = build_sanity_minibatch(cfg, batch_size=batch_size, sigma=sigma, device=device)
+    x, y, _loss_mask = build_sanity_minibatch(cfg, batch_size=batch_size, sigma=sigma, device=device)
     x = x.to(device)
     y = y.to(device)
-    loss_mask = loss_mask.to(device)
+    unused_mask = unused_mask_from_features(x)
 
     model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    print(f"Training on one minibatch ({NUM_FEATURE_CHANNELS} feature channels):")
+    print(f"Training on one minibatch ({NUM_FEATURE_CHANNELS} feature channels, unused-SC loss):")
     losses: List[float] = []
     for epoch in range(n_epochs):
         model.train()
         opt.zero_grad(set_to_none=True)
         pred = model(x)
-        loss = masked_huber_loss(pred, y, loss_mask, cfg.huber_delta)
+        loss = masked_huber_loss(pred, y, unused_mask, cfg.huber_delta)
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
         loss.backward()

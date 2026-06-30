@@ -25,6 +25,10 @@ isProject: false
 
 # CNN supervised training plan
 
+## After first train — improvement #1 (unused-SC loss)
+
+Phase 1b v1 (`phase1b_average_mse_vs_pilots_v1`) showed the CNN did not clearly beat **fixed** / **active**; a likely cause is training Huber on **all 32 SCs** while deploy uses `argmax` on **unused** SCs only. **Change:** at train time derive `loss_mask` from pilot mask channel in `X` (`unused_mask_from_features` in [`train.py`](new/error_estimators/cnn/train.py)); average Huber **per snapshot over unused SCs, then over batch** (legacy per-sample mean, not global sum/count); still save `phase1_best.pt` at lowest **val Huber** (unused-only); `y_label` and cached `.pt` `loss_mask` unchanged (no `--force-regen`). **Files:** [`train.py`](new/error_estimators/cnn/train.py) — `masked_huber_loss`, `run_epoch`, `sanity_check`; [`smoke_validation.py`](new/error_estimators/cnn/smoke_validation.py) — remove obsolete `loss_mask_all_ones` check. Re-run `train` → `eval`; compare to v1 figure. Pairwise hinge deferred if this is insufficient.
+
 ## Agreed design (from conversation + your answers)
 
 ### Role in the `new/` loop (concept only; not wired into [`simulation.py`](new/simulation.py) in this work)
