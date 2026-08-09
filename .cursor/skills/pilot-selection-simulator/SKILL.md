@@ -66,8 +66,9 @@ Estimate MSE without oracle `h_true` — stopping, logging, active scoring.
 |--------|-----------|------------|
 | `trace_min.py` | `estimate_nmse` = `tr(P)/N` | `simulation.py` stop + trace; exp1 y-axis |
 | `trace_min.py` | `active_subcarrier_score` → `J(k)` | `pilot_policy/active.py` |
+| `cnn/` | supervised `CNNErrorEstimator` (train/eval CLI) | **not wired** into loop yet; see skill `cnn-error-estimator` |
 
-**Extension:** new schemes in `error_estimators/<name>.py`; wire from simulation and/or policy.
+**Extension:** new schemes in `error_estimators/<name>.py`; wire from simulation and/or policy. For the CNN sub-project under `error_estimators/cnn/`, use skill **`cnn-error-estimator`**.
 
 ### Pilot policy (related axis)
 

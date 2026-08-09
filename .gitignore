@@ -11,3 +11,4 @@ tests/
 *.sbatch
 *.json
 *.png
+proposal/
