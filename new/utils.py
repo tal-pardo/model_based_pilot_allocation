@@ -80,12 +80,13 @@ def empirical_covariance(
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.complex64,
 ) -> torch.Tensor:
-    """Input: h_samples (K,N), reg ridge. Output: (N,N) sample covariance + reg*I."""
+    """Input: h_samples (K,N), reg ridge. Output: (N,N) sample covariance E[h h^H] + reg*I."""
     if h_samples.ndim == 3 and h_samples.shape[-1] == 1:
         h_samples = h_samples.squeeze(-1)
     h_samples = h_samples.to(device=device, dtype=dtype)
     k, n = h_samples.shape
-    sigma_hat = (h_samples.mH @ h_samples) / float(k)
+    # Rows are samples h_k^T, so sum_k h_k h_k^H = H^T conj(H); H^H H would give conj(Sigma).
+    sigma_hat = (h_samples.T @ h_samples.conj()) / float(k)
     sigma_hat = 0.5 * (sigma_hat + sigma_hat.mH)
     sigma_hat = sigma_hat + reg * torch.eye(n, device=sigma_hat.device, dtype=sigma_hat.dtype)
     return sigma_hat

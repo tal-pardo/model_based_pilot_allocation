@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import List
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -21,10 +21,21 @@ class RandomPolicy:
         max_pilots: int,
         device: torch.device,
         seed: int,
+        initial_indices: Optional[Sequence[int]] = None,
     ) -> None:
         _ = (n_antennas, max_pilots, device)
         self._nc = n_subcarriers
-        self._initial = initial_subcarriers_uniform(initial_pilot_subcarriers, n_subcarriers)
+        if initial_indices is not None:
+            init = [int(k) for k in initial_indices]
+            if len(init) != initial_pilot_subcarriers:
+                raise ValueError("initial_indices length must equal initial_pilot_subcarriers.")
+            if any(k < 0 or k >= n_subcarriers for k in init):
+                raise ValueError("initial_indices out of range.")
+            if len(set(init)) != len(init):
+                raise ValueError("initial_indices must be unique.")
+            self._initial = init
+        else:
+            self._initial = initial_subcarriers_uniform(initial_pilot_subcarriers, n_subcarriers)
         self._rng = random.Random(seed)
 
     def reset(self) -> None:

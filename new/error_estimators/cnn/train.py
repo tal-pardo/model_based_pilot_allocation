@@ -53,7 +53,7 @@ from config import ExpRunConfig
 from experiments.common import full_subcarrier_batch_true_mse, make_policy
 from pilot_policy.base import PilotPolicy, initial_subcarriers_uniform
 from simulation import run_until_threshold
-from utils import measure_subcarrier, resolve_device
+from utils import complex_standard_normal, measure_subcarrier, resolve_device
 
 LABEL_EPS = 1e-8
 NUM_FEATURE_CHANNELS = 6
@@ -99,6 +99,8 @@ class CnnTrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     eval_n_mc: int = 100
+    label_mode: Literal["current", "counterfactual"] = "current"
+    early_stop_patience: Optional[int] = None
 
     @property
     def n_total(self) -> int:
@@ -189,6 +191,71 @@ def block_error_labels(
         e_k = diff.abs().pow(2).mean().real
         y[k] = torch.log(e_k + label_eps)
     return y
+
+
+def label_suffix(cfg: "CnnTrainConfig") -> str:
+    """Input: config. Output: '_cf' for counterfactual label mode, else ''."""
+    return "_cf" if cfg.label_mode == "counterfactual" else ""
+
+
+def counterfactual_labels(
+    state: EstimatorState,
+    h_true: torch.Tensor,
+    used: Sequence[int],
+    na: int,
+    nc: int,
+    sigma2: float,
+    generator: torch.Generator,
+    *,
+    label_eps: float = LABEL_EPS,
+) -> torch.Tensor:
+    """Input: state (h_hat,P), h_true (N,1), used SCs, Na, Nc, sigma2, noise generator.
+    Output: (Nc,) log counterfactual NMSE labels.
+
+    For each unused candidate k, simulate hypothetically placing one pilot there (fresh noise,
+    one incremental LMMSE update) and label with the resulting full-vector true NMSE against
+    h_true. Exploits that a single-subcarrier pilot is a pure block-selector, so the Kalman
+    gain/update can be computed directly from P's block columns (O(N*Na^2) per candidate)
+    instead of the generic dense (N,N) update, and is vectorized across all unused candidates
+    at once via batched (Na,Na) solves. Used (already-piloted) SCs get a label_eps floor;
+    they are excluded from the training loss via the unused-SC mask anyway.
+    """
+    device = state.h_hat.device
+    dtype = state.h_hat.dtype
+    used_set = set(int(k) for k in used)
+    unused = [k for k in range(nc) if k not in used_set]
+    y_lab = torch.full((nc,), math.log(label_eps), device=device, dtype=torch.float32)
+    if not unused:
+        return y_lab
+
+    h_hat = state.h_hat  # (N,1)
+    p = state.P  # (N,N)
+    k_cand = len(unused)
+    k_idx = torch.tensor(unused, device=device, dtype=torch.long)
+    starts = k_idx * na
+    offsets = torch.arange(na, device=device)
+    block_idx = starts[:, None] + offsets[None, :]  # (K,Na)
+
+    p_cols = p[:, block_idx.reshape(-1)].reshape(p.shape[0], k_cand, na).permute(1, 0, 2)  # (K,N,Na)
+    p_blocks = p[block_idx[:, :, None], block_idx[:, None, :]]  # (K,Na,Na)
+    eye_na = torch.eye(na, device=device, dtype=dtype)
+    s_mats = sigma2 * eye_na.unsqueeze(0) + p_blocks  # (K,Na,Na)
+    inv_s = torch.linalg.solve(s_mats, eye_na.unsqueeze(0).expand(k_cand, na, na))  # (K,Na,Na)
+    gain = p_cols @ inv_s  # (K,N,Na)
+
+    noise = (sigma2**0.5) * complex_standard_normal(
+        k_cand, na, 1, device=device, dtype=dtype, generator=generator
+    )
+    h_true_blocks = h_true[block_idx]  # (K,Na,1)
+    h_hat_blocks = h_hat[block_idx]  # (K,Na,1)
+    innovation = (h_true_blocks + noise) - h_hat_blocks  # (K,Na,1)
+
+    delta_h = gain @ innovation  # (K,N,1)
+    h_new = h_hat.unsqueeze(0) + delta_h  # (K,N,1)
+    diff = h_new - h_true.unsqueeze(0)  # (K,N,1)
+    e_k = diff.abs().pow(2).mean(dim=(1, 2))  # (K,)
+    y_lab[k_idx] = torch.log(e_k + label_eps).float()
+    return y_lab
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +439,12 @@ def collect_snapshots_one_channel(
     rows: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     while n_pilots < cfg.max_pilots:
         x_feat = build_features(state.h_hat, mask, n_pilots, cfg.sigma2, na=na, nc=nc)
-        y_lab = block_error_labels(state.h_hat, h_true, na, nc, label_eps=cfg.label_eps)
+        if cfg.label_mode == "counterfactual":
+            y_lab = counterfactual_labels(
+                state, h_true, used, na, nc, cfg.sigma2, gen, label_eps=cfg.label_eps
+            )
+        else:
+            y_lab = block_error_labels(state.h_hat, h_true, na, nc, label_eps=cfg.label_eps)
         loss_mask = torch.ones(nc, device=device, dtype=torch.float32)
         rows.append((x_feat, y_lab, loss_mask))
 
@@ -497,7 +569,7 @@ def build_dataset_cache(
 ) -> Path:
     """Generate and save data/{split}.pt."""
     n_ch = n_channels if n_channels is not None else _n_channels_for_split(split, cfg)
-    out = out_path or (DATA_DIR / f"{split}.pt")
+    out = out_path or (DATA_DIR / f"{split}{label_suffix(cfg)}.pt")
     grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
 
     print(f"build {split}: {n_ch} channels, device={device}")
@@ -603,11 +675,13 @@ def train_loop(
     best_val = float("inf")
     best_epoch = -1
     best_top1 = 0.0
+    epochs_no_improve = 0
     metrics: List[Dict[str, Any]] = []
 
     print(
         f"train: device={device}, train={len(x_tr)} val={len(x_va)} "
-        f"batch={cfg.batch_size}, max_\epochs={cfg.max_epochs}, loss=unused-SC Huber (per-sample mean)"
+        f"batch={cfg.batch_size}, max_epochs={cfg.max_epochs}, label_mode={cfg.label_mode}, "
+        f"loss=unused-SC Huber (per-sample mean)"
     )
 
     for epoch in range(1, cfg.max_epochs + 1):
@@ -622,6 +696,7 @@ def train_loop(
             best_val = val_huber
             best_epoch = epoch
             best_top1 = val_top1
+            epochs_no_improve = 0
             star = " *"
             CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -635,6 +710,8 @@ def train_loop(
                 },
                 checkpoint_path,
             )
+        else:
+            epochs_no_improve += 1
 
         metrics.append(
             {"epoch": epoch, "train_huber": train_huber, "val_huber": val_huber, "val_top1": val_top1}
@@ -643,6 +720,10 @@ def train_loop(
             f"epoch {epoch:03d}/{cfg.max_epochs:03d}  train_huber={train_huber:.4f}  "
             f"val_huber={val_huber:.4f}  val_top1={val_top1:.3f}  {elapsed:.1f}s{star}"
         )
+
+        if cfg.early_stop_patience is not None and epochs_no_improve >= cfg.early_stop_patience:
+            print(f"early stopping at epoch {epoch} (no val improvement for {cfg.early_stop_patience} epochs)")
+            break
 
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     with metrics_path.open("w", encoding="utf-8") as f:
@@ -682,14 +763,30 @@ class _FixedInitPilotPolicy:
 
 
 class CnnPilotPolicy:
-    """Greedy argmax predicted block error on unused subcarriers."""
+    """Greedy pilot selection from predicted per-subcarrier scores on unused subcarriers.
 
-    def __init__(self, model: CNNErrorEstimator, *, na: int, nc: int, sigma2: float, device: torch.device) -> None:
+    select_mode="argmax": pilot the subcarrier with the highest predicted score (current-error
+    label paradigm: pilot the worst-currently-estimated SC).
+    select_mode="argmin": pilot the subcarrier with the lowest predicted score (counterfactual
+    label paradigm: pilot wherever placing a pilot is predicted to leave the lowest resulting NMSE).
+    """
+
+    def __init__(
+        self,
+        model: CNNErrorEstimator,
+        *,
+        na: int,
+        nc: int,
+        sigma2: float,
+        device: torch.device,
+        select_mode: Literal["argmax", "argmin"] = "argmax",
+    ) -> None:
         self._model = model
         self._na = na
         self._nc = nc
         self._sigma2 = sigma2
         self._device = device
+        self._select_mode = select_mode
 
     def reset(self) -> None:
         pass
@@ -715,6 +812,10 @@ class CnnPilotPolicy:
         with torch.no_grad():
             pred = self._model(x.unsqueeze(0)).squeeze(0)
         scores = pred.clone()
+        if self._select_mode == "argmin":
+            for k in used:
+                scores[k] = float("inf")
+            return int(scores.argmin().item())
         for k in used:
             scores[k] = float("-inf")
         return int(scores.argmax().item())
@@ -740,7 +841,10 @@ def run_closed_loop_mse_curve(
         if cnn_model is None:
             raise ValueError("cnn policy requires model")
         noise_seed = cfg.seed + EVAL_CNN_NOISE_OFFSET + channel_mc
-        inner: PilotPolicy = CnnPilotPolicy(cnn_model, na=na, nc=nc, sigma2=cfg.sigma2, device=device)
+        select_mode = "argmin" if cfg.label_mode == "counterfactual" else "argmax"
+        inner: PilotPolicy = CnnPilotPolicy(
+            cnn_model, na=na, nc=nc, sigma2=cfg.sigma2, device=device, select_mode=select_mode
+        )
     elif policy_mode == "fixed":
         noise_seed = cfg.seed + NOISE_OFFSET["fixed"] + channel_mc
         inner = make_policy("fixed", run_cfg, device, seed=noise_seed)
@@ -798,8 +902,9 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
     full_mse = float(np.mean(full_mse_values))
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-    fig_path = FIGURES_DIR / "phase1b_average_mse_vs_pilots.png"
-    json_path = FIGURES_DIR / "phase1b_average_mse_vs_pilots.json"
+    suffix = label_suffix(cfg)
+    fig_path = FIGURES_DIR / f"phase1b_average_mse_vs_pilots{suffix}.png"
+    json_path = FIGURES_DIR / f"phase1b_average_mse_vs_pilots{suffix}.json"
 
     plt.figure(figsize=(8.4, 4.8))
     for name, curve in mean_curves.items():
@@ -1053,7 +1158,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--n-channels", type=int, default=None, help="Override channel count for build smoke tests.")
+    parser.add_argument("--n-cov-mc", type=int, default=None, help="Override empirical Sigma MC sample count (default 512).")
     parser.add_argument("--force-regen", action="store_true")
+    parser.add_argument(
+        "--label-mode",
+        choices=("current", "counterfactual"),
+        default=None,
+        help="current = per-SC current-error labels (existing baseline); "
+        "counterfactual = look-ahead label from simulating a pilot at each unused SC.",
+    )
+    parser.add_argument("--train-channels", type=int, default=None)
+    parser.add_argument("--val-channels", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--huber-delta", type=float, default=None)
+    parser.add_argument("--eval-n-mc", type=int, default=None)
+    parser.add_argument("--early-stop-patience", type=int, default=None)
     return parser.parse_args()
 
 
@@ -1068,16 +1188,35 @@ def main() -> None:
         cfg.batch_size = args.batch_size
     if args.max_epochs is not None:
         cfg.max_epochs = args.max_epochs
+    if args.n_cov_mc is not None:
+        cfg.n_cov_mc = args.n_cov_mc
+    if args.label_mode is not None:
+        cfg.label_mode = args.label_mode
+    if args.train_channels is not None:
+        cfg.train_channels = args.train_channels
+    if args.val_channels is not None:
+        cfg.val_channels = args.val_channels
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
+    if args.huber_delta is not None:
+        cfg.huber_delta = args.huber_delta
+    if args.eval_n_mc is not None:
+        cfg.eval_n_mc = args.eval_n_mc
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience = args.early_stop_patience
 
     if args.phase == "sanity":
         sanity_check(cfg)
         return
 
     device = resolve_device(cfg.device)
+    suffix = label_suffix(cfg)
 
     if args.phase == "build":
-        train_pt = DATA_DIR / "train.pt"
-        val_pt = DATA_DIR / "val.pt"
+        train_pt = DATA_DIR / f"train{suffix}.pt"
+        val_pt = DATA_DIR / f"val{suffix}.pt"
         if not args.force_regen and train_pt.exists() and val_pt.exists():
             print(f"cache hit: {train_pt}, {val_pt} (use --force-regen to rebuild)")
             return
@@ -1090,15 +1229,15 @@ def main() -> None:
     if args.phase == "train":
         train_loop(
             cfg,
-            train_path=DATA_DIR / "train.pt",
-            val_path=DATA_DIR / "val.pt",
-            checkpoint_path=CHECKPOINT_DIR / "phase1_best.pt",
-            metrics_path=CHECKPOINT_DIR / "phase1_metrics.json",
+            train_path=DATA_DIR / f"train{suffix}.pt",
+            val_path=DATA_DIR / f"val{suffix}.pt",
+            checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt",
+            metrics_path=CHECKPOINT_DIR / f"phase1{suffix}_metrics.json",
         )
         return
 
     if args.phase == "eval":
-        eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / "phase1_best.pt")
+        eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
         return
 
     if args.phase == "build-finetune":

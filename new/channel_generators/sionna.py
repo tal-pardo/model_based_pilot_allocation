@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from sionna.phy import config as sionna_config
 from sionna.phy.channel import cir_to_ofdm_channel, exp_corr_mat, subcarrier_frequencies
 from sionna.phy.channel.tr38901 import AntennaArray, CDL, TDL
 
@@ -53,6 +54,8 @@ def _sionna_device(device: torch.device) -> str:
 
 
 def _set_torch_seed(seed: int, device: torch.device) -> None:
+    # Sionna 2.x draws from its own RNGs (sionna.phy.config), not torch's global one.
+    sionna_config.seed = seed
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
@@ -67,10 +70,15 @@ def sample_tdl_ofdm_channel(
     device: torch.device,
     n_antennas: int = 1,
     rho_space: Optional[float] = None,
+    speed: float = 0.0,
+    symbol_sampling_frequency: Optional[float] = None,
     dtype: torch.dtype = torch.complex64,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    """Input: TDL model, OFDM dims, grid, device. Output: H (Na,Nc) or slot H (L,Nc)."""
+    """Input: TDL model, OFDM dims, grid, device, speed (m/s, Doppler via min=max=speed).
+    `symbol_sampling_frequency` overrides the rate `num_time_steps` are drawn at (default
+    `grid.bandwidth`, i.e. per-sample spacing, not per-OFDM-symbol spacing).
+    Output: H (Na,Nc) or slot H (L,Nc)."""
     if seed is not None:
         _set_torch_seed(seed, device)
 
@@ -81,8 +89,8 @@ def sample_tdl_ofdm_channel(
         "carrier_frequency": grid.carrier_frequency,
         "num_rx_ant": n_antennas,
         "num_tx_ant": 1,
-        "min_speed": 0.0,
-        "max_speed": 0.0,
+        "min_speed": speed,
+        "max_speed": speed,
         "device": sionna_device,
     }
     if rho_space is not None:
@@ -90,7 +98,8 @@ def sample_tdl_ofdm_channel(
         tdl_kwargs["rx_corr_mat"] = exp_corr_mat(rho, n_antennas, device=sionna_device).to(dtype)
 
     tdl = TDL(**tdl_kwargs)
-    a, tau = tdl(batch_size=1, num_time_steps=n_ofdm_symbols, sampling_frequency=grid.bandwidth)
+    sampling_frequency = symbol_sampling_frequency if symbol_sampling_frequency is not None else grid.bandwidth
+    a, tau = tdl(batch_size=1, num_time_steps=n_ofdm_symbols, sampling_frequency=sampling_frequency)
     frequencies = subcarrier_frequencies(grid.fft_size, grid.subcarrier_spacing, device=sionna_device)
     h_freq = cir_to_ofdm_channel(frequencies, a, tau, normalize=True)
     if n_ofdm_symbols == 1 and n_antennas > 1:
@@ -148,8 +157,61 @@ def sample_tdl_c_channel(
     )
 
 
-def sample_cdl_c_channel(
+def sample_tdl_a_time_freq_channel(
     *,
+    n_symbols: int,
+    n_subcarriers: int,
+    grid: SionnaOFDMGrid,
+    device: torch.device,
+    speed: float = 0.0,
+    dtype: torch.dtype = torch.complex64,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Input: L symbols, Nc, grid, device, speed (m/s). Output: H_tf (L,Nc) TDL-A single-antenna slot,
+    symbols spaced at the OFDM symbol rate (1/subcarrier_spacing, CP ignored)."""
+    return sample_tdl_ofdm_channel(
+        model="A",
+        n_ofdm_symbols=n_symbols,
+        n_subcarriers=n_subcarriers,
+        grid=grid,
+        device=device,
+        n_antennas=1,
+        speed=speed,
+        symbol_sampling_frequency=grid.subcarrier_spacing,
+        dtype=dtype,
+        seed=seed,
+    )
+
+
+def sample_tdl_c_time_freq_channel(
+    *,
+    n_symbols: int,
+    n_subcarriers: int,
+    grid: SionnaOFDMGrid,
+    device: torch.device,
+    speed: float = 0.0,
+    dtype: torch.dtype = torch.complex64,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Input: L symbols, Nc, grid, device, speed (m/s). Output: H_tf (L,Nc) TDL-C single-antenna slot,
+    symbols spaced at the OFDM symbol rate (1/subcarrier_spacing, CP ignored)."""
+    return sample_tdl_ofdm_channel(
+        model="C",
+        n_ofdm_symbols=n_symbols,
+        n_subcarriers=n_subcarriers,
+        grid=grid,
+        device=device,
+        n_antennas=1,
+        speed=speed,
+        symbol_sampling_frequency=grid.subcarrier_spacing,
+        dtype=dtype,
+        seed=seed,
+    )
+
+
+def sample_cdl_channel(
+    *,
+    model: str,
     n_antennas: int,
     n_subcarriers: int,
     grid: SionnaOFDMGrid,
@@ -157,7 +219,7 @@ def sample_cdl_c_channel(
     dtype: torch.dtype = torch.complex64,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    """Input: Na, Nc, grid, device. Output: H (Na,Nc) CDL-C uplink."""
+    """Input: CDL model ('A'..'E'), Na, Nc, grid, device. Output: H (Na,Nc) uplink."""
     if seed is not None:
         _set_torch_seed(seed, device)
     sionna_device = _sionna_device(device)
@@ -178,7 +240,7 @@ def sample_cdl_c_channel(
         carrier_frequency=grid.carrier_frequency,
     )
     cdl = CDL(
-        model="C",
+        model=model,
         delay_spread=grid.delay_spread,
         carrier_frequency=grid.carrier_frequency,
         ut_array=ut_array,
@@ -192,6 +254,27 @@ def sample_cdl_c_channel(
     frequencies = subcarrier_frequencies(grid.fft_size, grid.subcarrier_spacing, device=sionna_device)
     h_freq = cir_to_ofdm_channel(frequencies, a, tau, normalize=True)
     return _h_freq_to_h(h_freq, n_antennas, n_subcarriers).to(device=device, dtype=dtype)
+
+
+def sample_cdl_c_channel(
+    *,
+    n_antennas: int,
+    n_subcarriers: int,
+    grid: SionnaOFDMGrid,
+    device: torch.device,
+    dtype: torch.dtype = torch.complex64,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Input: Na, Nc, grid, device. Output: H (Na,Nc) CDL-C uplink."""
+    return sample_cdl_channel(
+        model="C",
+        n_antennas=n_antennas,
+        n_subcarriers=n_subcarriers,
+        grid=grid,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+    )
 
 
 def vec_from_h(h: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,4 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+We proposed an incremental pilot-selection framework for OFDM channel estimation that measures one subcarrier at a time, tracks an LMMSE posterior, and greedily selects the next subcarrier to maximize the predicted reduction in posterior error-covariance trace. The method is entirely model-based and requires no training. Experiments show that this active rule reaches a target estimation quality with fewer pilots than fixed or random sounding when the assumed prior matches the true channel, while prior mismatch degrades both true error and the reliability of the model-based stopping criterion. Since the true channel covariance is generally not known exactly in practice, future work includes learning the prior online and replacing the closed-form selection score with a learned predictor trained directly from data.

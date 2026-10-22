@@ -1,0 +1,35 @@
+\section{Experimental Study}
+\label{sec:experiments}
+
+\smallskip
+\noindent
+{\bf Setup:}
+We consider an OFDM link with $N_a{=}16$ receive antennas and $N_c{=}32$ subcarriers ($N{=}512$), with noise variance $\sigma^2$ fixed across experiments. Results are averaged over $50$ Monte Carlo trials. Unless otherwise stated, sounding stops once $\widehat{\mathrm{NMSE}}\le 0.1$.
+
+\smallskip
+\noindent
+{\bf Compared Algorithms:}
+\emph{Fixed} bootstraps $k_0{=}2$ uniformly spaced subcarriers and then always fills the largest remaining gap, independent of the measured data. \emph{Random} selects uniformly among the unmeasured subcarriers. \emph{Active} is the proposed rule of Section~\ref{sec:method}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{exp1_pilot_policy.png}
+  \caption{Gaussian channel with a matched Kronecker prior. Mean estimated NMSE vs. number of pilots for fixed, random, and active policies. Active reaches the target threshold with fewer pilots than fixed or random.}
+  \label{fig:exp1}
+\end{figure}
+
+\smallskip
+\noindent
+{\bf Results:}
+Fig.~\ref{fig:exp1} compares the three policies under a Gaussian channel with a matched Kronecker prior. Active selection consistently reaches the target estimation quality with fewer pilots than fixed or random sounding, confirming that exploiting the posterior covariance to choose the next subcarrier reduces pilot overhead when the prior is accurate.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{exp6_matched_vs_diag.png}
+  \caption{Toeplitz-correlated Gaussian channel ($\rho{=}0.8$). Solid curves are true MSE; dotted curves are the model-based estimate $\widehat{\mathrm{NMSE}}$. Active selection with a matched prior achieves the lowest true error; an unmatched diagonal prior yields both higher true error and a clear gap between true and estimated error.}
+  \label{fig:exp6}
+\end{figure}
+
+Fig.~\ref{fig:exp6} isolates the effect of prior mismatch by comparing active selection under a matched Toeplitz prior, active selection under an unmatched diagonal prior, and fixed sounding under the matched prior. Matching the prior to the true channel statistics is necessary for the active rule to realize its full benefit: under the diagonal prior, true error degrades and the model-based estimate $\widehat{\mathrm{NMSE}}$ no longer tracks the true error closely, confirming the dependence on prior accuracy raised in Section~\ref{sec:method}.
+
+Finally, we note that replacing the closed-form score in~\eqref{eq:active_score} with a learned predictor can further improve pilot efficiency; initial results with such a learned allocator are promising but are left to future work rather than detailed here.

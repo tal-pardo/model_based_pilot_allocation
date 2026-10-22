@@ -1,0 +1,72 @@
+\section{System Model and Problem Formulation}
+\label{sec:system_model}
+
+{\bf Channel and Signal Model:}
+Consider an OFDM link with $N_a$ receive antennas and $N_c$ subcarriers, whose spatial and frequency correlation we model via a Kronecker product of Toeplitz correlation matrices, $\boldsymbol\Sigma=\mathbf R_{\mathrm{freq}}\otimes\mathbf R_{\mathrm{space}}$~\cite{yu2025lmmse}. Stack the channel matrix $\mathbf H \in \mathbb C^{N_a\times N_c}$ by subcarrier into the vector
+\begin{equation}
+\mathbf h = \mathrm{vec}(\mathbf H) = \bigl[\mathbf H_{:,0}^\top,\ldots,\mathbf H_{:,N_c-1}^\top\bigr]^\top \in \mathbb C^N, \qquad N = N_a N_c,
+\label{eq:vecH}
+\end{equation}
+so that subcarrier $k$ occupies indices $kN_a,\ldots,(k{+}1)N_a{-}1$ of $\mathbf h$. We model $\mathbf h$ as a circularly-symmetric complex Gaussian vector, $\mathbf h \sim \mathcal{CN}(\mathbf 0, \boldsymbol\Sigma)$, with prior covariance $\boldsymbol\Sigma = \mathbb E[\mathbf h\mathbf h^H]$.
+
+At step $t$, we measure a single subcarrier $k_t$ using a known pilot symbol. The resulting observation is
+\begin{equation}
+\mathbf y_t = \mathbf X_{k_t} \mathbf h + \mathbf n_t, \qquad \mathbf n_t \sim \mathcal{CN}(\mathbf 0, \sigma^2 \mathbf I_{N_a}),
+\label{eq:obs_model}
+\end{equation}
+where $\mathbf X_{k_t} \in \mathbb C^{N_a \times N}$ selects the $N_a$ entries of $\mathbf h$ associated with subcarrier $k_t$, and $\sigma^2$ is the known noise variance. Each subcarrier is measured at most once; previously measured subcarriers are not re-measured.
+
+\smallskip
+\noindent
+{\bf Problem Formulation:}
+We wish to reach a target estimation quality using as few pilot measurements as possible. At each step $t$, having already measured a subset of subcarriers, we must decide which unmeasured subcarrier to measure next, and when to stop. This is made difficult by two facts:
+
+\smallskip
+\noindent
+\textbf{C1:} The decision must be made online, using only the measurements collected so far, without access to future observations or to the true channel $\mathbf h$.
+
+\smallskip
+\noindent
+\textbf{C2:} Since $\mathbf h$ is unknown at deployment time, both the selection rule and the stopping rule must rely on a model-based error proxy rather than the true estimation error.
+
+\smallskip
+\noindent
+Formally, letting $\hat{\mathbf h}_t$ denote the channel estimate after $t$ pilots, the goal is to find the smallest $T$ such that a model-based error estimate $\widehat{\mathrm{NMSE}}_T$ (defined below) satisfies $\widehat{\mathrm{NMSE}}_T \le \tau$ for a target threshold $\tau$, while choosing the measurement order $k_1,\ldots,k_T$ causally, i.e., subject to C1-C2.
+
+\smallskip
+\noindent
+{\bf LMMSE Channel Estimator:}
+Given the prior $\boldsymbol\Sigma$ and the sequence of pilot observations, we track the channel posterior using the linear minimum mean-square error (LMMSE) estimator, summarized by the posterior mean $\hat{\mathbf h}$ and error covariance $\mathbf P = \mathbb E[(\mathbf h-\hat{\mathbf h})(\mathbf h-\hat{\mathbf h})^H]$. After the first pilot, measuring subcarrier $k_1$ with observation $\mathbf y_1$,
+\begin{align}
+\mathbf P_1 &= \left(\boldsymbol\Sigma^{-1} + \tfrac{1}{\sigma^2}\mathbf X_{k_1}^H \mathbf X_{k_1}\right)^{-1},
+\label{eq:lmmse_init_P}
+\\
+\hat{\mathbf h}_1 &= \tfrac{1}{\sigma^2}\mathbf P_1 \mathbf X_{k_1}^H \mathbf y_1.
+\label{eq:lmmse_init_h}
+\end{align}
+After each subsequent pilot, measuring subcarrier $k_t$ with observation $\mathbf y_t$,
+\begin{align}
+\mathbf S_t &= \sigma^2 \mathbf I_{N_a} + \mathbf X_{k_t} \mathbf P_{t-1} \mathbf X_{k_t}^H,
+\label{eq:lmmse_S}
+\\
+\mathbf K_t &= \mathbf P_{t-1} \mathbf X_{k_t}^H \mathbf S_t^{-1},
+\label{eq:lmmse_K}
+\\
+\hat{\mathbf h}_t &= \hat{\mathbf h}_{t-1} + \mathbf K_t\bigl(\mathbf y_t - \mathbf X_{k_t}\hat{\mathbf h}_{t-1}\bigr),
+\label{eq:lmmse_h_update}
+\\
+\mathbf P_t &= \bigl(\mathbf I - \mathbf K_t \mathbf X_{k_t}\bigr)\mathbf P_{t-1}.
+\label{eq:lmmse_P_update}
+\end{align}
+
+Since $\mathbf P_t$ does not depend on the true channel, it provides a model-based proxy for the estimation error,
+\begin{equation}
+\widehat{\mathrm{NMSE}}_t = \frac{\mathrm{tr}(\mathbf P_t)}{N},
+\label{eq:nmse_hat}
+\end{equation}
+which can be computed online and is used both to decide when to stop measuring and, as discussed in Section~\ref{sec:method}, to decide which subcarrier to measure next. For evaluation purposes only, we also track the oracle true error
+\begin{equation}
+\mathrm{NMSE}_t = \frac{\|\hat{\mathbf h}_t - \mathbf h\|_2^2}{N},
+\label{eq:nmse_true}
+\end{equation}
+which requires knowledge of the true channel $\mathbf h$ and is therefore unavailable at deployment time.

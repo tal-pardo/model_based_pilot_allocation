@@ -13,14 +13,23 @@ from error_estimators.trace_min import estimate_nmse
 from pilot_policy.active import ActivePolicy
 from pilot_policy.fixed import FixedPolicy
 from pilot_policy.random import RandomPolicy
+from pilot_policy.repeat import RepeatPolicy
 from simulation import RunTrace
 from utils import empirical_nmse, measure_subcarrier, stack_observations
+
+# Shared plot convention for all figures: (color, linestyle, marker) per policy.
+POLICY_STYLES: dict[str, tuple[str, str, str]] = {
+    "fixed": ("C0", "-", "o"),
+    "random": ("C1", "--", "s"),
+    "active": ("C2", "-.", "^"),
+}
+FULL_LMMSE_COLOR, FULL_LMMSE_LINESTYLE = "red", ":"
 
 EXP3_STYLES: dict[str, tuple[str, str | tuple, str | None]] = {
     "fixed true": ("C0", "-", "o"),
     "fixed est": ("C0", (0, (1, 2)), None),
-    "active true": ("C1", "-", "s"),
-    "active est": ("C1", (0, (1, 2)), None),
+    "active true": ("C2", "-", "^"),
+    "active est": ("C2", (0, (1, 2)), None),
 }
 
 
@@ -39,6 +48,8 @@ def make_policy(name: str, cfg: ExpRunConfig, device: torch.device, seed: int):
         return RandomPolicy(**common, seed=seed)
     if name == "active":
         return ActivePolicy(**common, sigma2=cfg.sigma2)
+    if name == "repeat":
+        return RepeatPolicy(**common)
     raise ValueError(f"Unknown policy: {name}")
 
 
@@ -345,8 +356,8 @@ def plot_true_vs_est_overlay(
         baseline_values = [full_lmmse_baselines[policy] for policy in ("fixed", "active")]
         ax.axhline(
             float(np.mean(baseline_values)),
-            color="red",
-            linestyle=":",
+            color=FULL_LMMSE_COLOR,
+            linestyle=FULL_LMMSE_LINESTYLE,
             linewidth=1.2,
             label=f"full LMMSE true (Nc={n_subcarriers})",
         )

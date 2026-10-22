@@ -1,0 +1,46 @@
+\section{Active Pilot Selection}
+\label{sec:method}
+
+Section~\ref{sec:system_model} formulates channel estimation using a generic LMMSE update driven by whichever subcarrier is measured next, but leaves open how that subcarrier should be chosen. We now propose an active selection rule that picks, at each step, the subcarrier expected to reduce the estimation error the most, directly addressing C1-C2.
+
+\smallskip
+\noindent
+{\bf Selection Rule:}
+Let $\mathcal K_{t-1}$ denote the set of subcarriers measured through step $t-1$. From the incremental LMMSE update in~\eqref{eq:lmmse_S}-\eqref{eq:lmmse_P_update}, measuring subcarrier $k$ next would reduce the trace of the error covariance by
+\begin{equation}
+\Delta_t(k) = \mathrm{tr}(\mathbf P_{t-1}) - \mathrm{tr}(\mathbf P_t) = \mathrm{tr}\!\left( \bigl(\sigma^2\mathbf I_{N_a} + \mathbf P_{t-1}^{(k)}\bigr)^{-1} \mathbf Q_{t-1}^{(k)} \right),
+\label{eq:active_score}
+\end{equation}
+where $\mathbf P_{t-1}^{(k)}$ is the $N_a\times N_a$ diagonal block of $\mathbf P_{t-1}$ corresponding to subcarrier $k$, and $\mathbf Q_{t-1}^{(k)}$ is the product of the corresponding row and column blocks of $\mathbf P_{t-1}$, capturing how strongly subcarrier $k$ is correlated with the rest of the channel. Crucially, $\Delta_t(k)$ can be evaluated for every $k \notin \mathcal K_{t-1}$ directly from $\mathbf P_{t-1}$, without performing the update and without knowledge of $\mathbf h$, satisfying C2. The active rule greedily selects
+\begin{equation}
+k_t = \arg\max_{k \notin \mathcal K_{t-1}} \Delta_t(k),
+\label{eq:active_argmax}
+\end{equation}
+using only information available at step $t$, satisfying C1.
+
+\smallskip
+\noindent
+{\bf Bootstrapping and Stopping:}
+The policy is initialized with $k_0$ uniformly spaced pilots before the active rule takes over, and terminates once $\widehat{\mathrm{NMSE}}_t \le \tau$, as defined in~\eqref{eq:nmse_hat}, or once a maximum pilot budget is reached. The complete procedure is summarized in Algorithm~\ref{alg:active}.
+
+\begin{algorithm}[t]
+\caption{Active Pilot Selection}
+\label{alg:active}
+\begin{algorithmic}[1]
+\Require Prior $\boldsymbol\Sigma$, noise variance $\sigma^2$, threshold $\tau$, bootstrap size $k_0$
+\State Measure $k_0$ uniformly spaced subcarriers; initialize $(\hat{\mathbf h},\mathbf P)$ via~\eqref{eq:lmmse_init_P}-\eqref{eq:lmmse_init_h}
+\While{$\mathrm{tr}(\mathbf P)/N > \tau$ and budget not reached}
+  \For{each $k \notin \mathcal K_{t-1}$}
+    \State Compute $\Delta_t(k)$ via~\eqref{eq:active_score}
+  \EndFor
+  \State $k_t \gets \arg\max_k \Delta_t(k)$
+  \State Measure subcarrier $k_t$; update $(\hat{\mathbf h},\mathbf P)$ via~\eqref{eq:lmmse_S}-\eqref{eq:lmmse_P_update}
+\EndWhile
+\State \Return $\hat{\mathbf h}$
+\end{algorithmic}
+\end{algorithm}
+
+\smallskip
+\noindent
+{\bf Discussion:}
+The active rule in~\eqref{eq:active_score}-\eqref{eq:active_argmax} is entirely model-based: it requires no training data and no learned parameters, only the prior $\boldsymbol\Sigma$ and the LMMSE recursion already used for estimation. As shown in Section~\ref{sec:experiments}, its performance is tied to how well $\boldsymbol\Sigma$ matches the true channel statistics, since $\Delta_t(k)$ is itself computed from $\mathbf P_{t-1}$, which is only as accurate as the assumed prior. A natural extension, which we leave for future work, is to replace the closed-form score in~\eqref{eq:active_score} with a learned predictor trained to estimate the benefit of each candidate subcarrier directly from data, potentially compensating for prior mismatch.

@@ -15,12 +15,27 @@ if str(_NEW_ROOT) not in sys.path:
 from channel_generators.sigma_diag import assert_sigma_diag, build_sigma_diag_from_tdl
 from channel_generators.sionna import SionnaOFDMGrid
 from config import Exp6Config
-from experiments.common import EXP3_STYLES, make_policy, mean_curve
+from experiments.common import make_policy, mean_curve
 from simulation import RunTrace, run_until_threshold
 from utils import complex_standard_normal, exponential_covariance, resolve_device, set_seed
 
-POLICY = "fixed"
-NOISE_SEED_OFFSET = 0
+# (policy, prior_label) — only combinations plotted
+RUN_SPECS = (
+    ("active", "diag"),
+    ("active", "toep"),
+    ("fixed", "toep"),
+)
+NOISE_SEED_OFFSET = {"fixed": 0, "active": 10_000}
+
+EXP6_STYLES: dict[str, tuple[str, str | tuple, str | None]] = {
+    "active diag true": ("C0", "-", "o"),
+    "active diag est": ("C0", (0, (1, 2)), None),
+    "active toep true": ("C2", "-", "s"),
+    "active toep est": ("C2", (0, (1, 2)), None),
+    "fixed toep true": ("C1", "-", "^"),
+    "fixed toep est": ("C1", (0, (1, 2)), None),
+}
+CURVE_ORDER = tuple(EXP6_STYLES.keys())
 
 
 def default_config() -> Exp6Config:
@@ -67,28 +82,38 @@ def _sample_mc_toeplitz_channels(
     return channels
 
 
-def _run_mc_fixed(
+def _run_mc_policy(
     cfg: Exp6Config,
     *,
+    policy_name: str,
     h_list: list[torch.Tensor],
     sigma: torch.Tensor,
     device: torch.device,
 ) -> list[RunTrace]:
     traces: list[RunTrace] = []
+    noise_offset = NOISE_SEED_OFFSET[policy_name]
     for mc, h_true in enumerate(h_list):
-        gen_noise = torch.Generator(device=device).manual_seed(cfg.seed + NOISE_SEED_OFFSET + mc)
-        policy = make_policy(POLICY, cfg, device, seed=cfg.seed + NOISE_SEED_OFFSET + mc)
+        gen_noise = torch.Generator(device=device).manual_seed(cfg.seed + noise_offset + mc)
+        policy = make_policy(policy_name, cfg, device, seed=cfg.seed + noise_offset + mc)
         traces.append(
             run_until_threshold(h_true, sigma, cfg, policy, device=device, generator=gen_noise)
         )
     return traces
 
 
-def _build_fixed_curves(traces: list[RunTrace]) -> dict[str, np.ndarray]:
-    return {
-        "fixed true": mean_curve(traces, field="nmse_true"),
-        "fixed est": mean_curve(traces, field="nmse_hat"),
-    }
+def _curve_name(policy: str, prior: str, field: str) -> str:
+    return f"{policy} {prior} {field}"
+
+
+def _build_curves(
+    traces_by_spec: dict[tuple[str, str], list[RunTrace]],
+) -> dict[str, np.ndarray]:
+    curves: dict[str, np.ndarray] = {}
+    for policy, prior in RUN_SPECS:
+        traces = traces_by_spec[(policy, prior)]
+        curves[_curve_name(policy, prior, "true")] = mean_curve(traces, field="nmse_true")
+        curves[_curve_name(policy, prior, "est")] = mean_curve(traces, field="nmse_hat")
+    return curves
 
 
 def _slice_pilot_axis(
@@ -117,15 +142,15 @@ def save_exp6_figure(
     x = np.arange(k0, target + 1)
     plot_len = len(x)
 
-    fig, ax = plt.subplots(1, 1, figsize=(6.5, 4.5), constrained_layout=True)
-    styles = {"fixed true": EXP3_STYLES["fixed true"], "fixed est": EXP3_STYLES["fixed est"]}
-
-    for name, curve in curves.items():
-        color, ls, mk = styles[name]
-        y = _slice_pilot_axis(curve, k0=k0, target_pilots=target)
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5.0), constrained_layout=True)
+    for name in CURVE_ORDER:
+        color, ls, mk = EXP6_STYLES[name]
+        y = _slice_pilot_axis(curves[name], k0=k0, target_pilots=target)
         plot_kwargs = dict(linestyle=ls, linewidth=1.6, color=color, label=name)
         if mk is not None:
             plot_kwargs["marker"] = mk
+            plot_kwargs["markersize"] = 4
+            plot_kwargs["markevery"] = max(1, plot_len // 8)
         ax.semilogy(x, y, **plot_kwargs)
 
     tick_step = 5 if plot_len > 10 else 1
@@ -134,18 +159,38 @@ def save_exp6_figure(
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
     ax.set_xlabel("Number of pilots")
     ax.set_ylabel("Mean MSE  true or tr(P)/N")
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
 
-    suptitle = (
-        f"exp6 Toeplitz rho={cfg.rho_toeplitz} + Sigma_diag (fixed)  "
-        f"Na={cfg.n_antennas}, Nc={cfg.n_subcarriers}, n_mc={cfg.n_mc}, "
-        f"pilots={k0}..{target}, sigma_H2={sigma_h2:.3f}"
+    fig.suptitle(
+        f"exp6 Toeplitz truth: active diag vs active/fixed toep  "
+        f"rho={cfg.rho_toeplitz}, Na={cfg.n_antennas}, Nc={cfg.n_subcarriers}, "
+        f"n_mc={cfg.n_mc}, pilots={k0}..{target}, sigma_H2={sigma_h2:.3f}",
+        fontsize=10,
     )
-    fig.suptitle(suptitle, fontsize=10)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Saved figure: {out_path}")
+
+
+def _print_summary(curves: dict[str, np.ndarray], *, target: int) -> None:
+    idx = target - 1
+    if idx < 0:
+        return
+    parts: list[str] = []
+    for policy, prior in RUN_SPECS:
+        true_name = _curve_name(policy, prior, "true")
+        est_name = _curve_name(policy, prior, "est")
+        if idx >= len(curves[true_name]):
+            return
+        t = curves[true_name][idx]
+        e = curves[est_name][idx]
+        parts.append(f"{policy}+{prior}: true={t:.6e}, est={e:.6e}, gap={t - e:.6e}")
+    ad = curves[_curve_name("active", "diag", "true")][idx]
+    at = curves[_curve_name("active", "toep", "true")][idx]
+    ft = curves[_curve_name("fixed", "toep", "true")][idx]
+    parts.append(f"true gaps: active(diag-toep)={ad - at:.6e}, fixed_toep-active_toep={ft - at:.6e}")
+    print(f"at {target} pilots: " + "; ".join(parts))
 
 
 def run_exp6(cfg: Exp6Config) -> None:
@@ -181,21 +226,22 @@ def run_exp6(cfg: Exp6Config) -> None:
         f"sigma_H2={sigma_h2:.6f}, reg={cfg.reg_kron:g}"
     )
 
+    sigmas = {"diag": sigma_diag, "toep": sigma_toep}
     h_list = _sample_mc_toeplitz_channels(cfg, chol=chol, device=device)
-    traces = _run_mc_fixed(cfg, h_list=h_list, sigma=sigma_diag, device=device)
 
-    target = cfg.target_pilots
-    k0 = cfg.initial_pilot_subcarriers
-    curves = _build_fixed_curves(traces)
-    true_s = curves["fixed true"]
-    est_s = curves["fixed est"]
-    n_plot = min(target - k0 + 1, len(true_s) - (k0 - 1), len(est_s) - (k0 - 1))
-    if n_plot > 0:
-        idx = k0 - 1 + n_plot - 1
-        print(
-            f"Toeplitz (fixed) at {target} pilots: true={true_s[idx]:.6e}, "
-            f"est={est_s[idx]:.6e}, gap={true_s[idx] - est_s[idx]:.6e}"
+    traces_by_spec: dict[tuple[str, str], list[RunTrace]] = {}
+    for policy, prior in RUN_SPECS:
+        print(f"Running policy={policy}, prior={prior} ...")
+        traces_by_spec[(policy, prior)] = _run_mc_policy(
+            cfg,
+            policy_name=policy,
+            h_list=h_list,
+            sigma=sigmas[prior],
+            device=device,
         )
+
+    curves = _build_curves(traces_by_spec)
+    _print_summary(curves, target=cfg.target_pilots)
     save_exp6_figure(
         curves,
         cfg=cfg,
@@ -206,7 +252,10 @@ def run_exp6(cfg: Exp6Config) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="exp6: Toeplitz Gaussian truth + diagonal Sigma prior (true vs est MSE)"
+        description=(
+            "exp6: Toeplitz truth; one figure — active+diag, active+toep, fixed+toep "
+            "(true+est each)"
+        )
     )
     p.add_argument("--n-antennas", type=int, default=None)
     p.add_argument("--n-subcarriers", type=int, default=None)
