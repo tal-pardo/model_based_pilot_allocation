@@ -25,6 +25,8 @@ Learned **per-subcarrier** predictor for the incremental simulator in `new/`. In
 
 **Hard repo-layout constraint:** all implementation for this CNN lives inside `new/error_estimators/cnn/`. The only two files outside this folder that are allowed to exist/change for this work are `new/pilot_policy/cnn.py` (first-class `PilotPolicy` wrapping a trained checkpoint) and `new/experiments/exp11_cnn_allocator.py` (fixed vs active vs cnn comparison). Nothing else in `new/` (simulator, other pilot policies, `channel_estimators/`, `channel_generators/`, `trace_min.py`, `experiments/common.py`, other `exp*.py`) may be edited to support this CNN — those two consumer files call existing functions (e.g. `experiments.common.make_policy` for the fixed/active arms) read-only.
 
+**One exception, the other direction:** `run_closed_loop_mse_curve`/`eval_phase1b_time_freq`/the CLI's `--rl-checkpoint` flag have a small `"rl"` branch that lazy-imports `RlPilotPolicy`/`load_rl_checkpoint` from `error_estimators/rl/train.py` (an RL alternative to this CNN, see **[rl-error-estimator](../rl-error-estimator/SKILL.md)**) so the `time_freq` closed-loop comparison can show a 4th `fixed`/`active`/`cnn`/`rl` arm. The import is local to those functions (not a module-level import) specifically to avoid a two-way import cycle between the two modules — keep it that way.
+
 ## Role in `new/` (Layer C)
 
 | Today (`trace_min`) | This CNN |

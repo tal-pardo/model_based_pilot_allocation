@@ -11,6 +11,7 @@ Model-based pilot allocation for OFDM channel estimation (PyTorch, complex Gauss
 |------|-------|
 | `new/`: simulation loop, channel generators, LMMSE, error estimators, pilot policies, exp1–exp9, seeds, vec(H) convention | `pilot-selection-simulator` |
 | `new/error_estimators/cnn/`: supervised CNN error estimator, `train.py` phases | `cnn-error-estimator` |
+| `new/error_estimators/rl/`: REINFORCE/PPO pilot-allocation policy (alternative to the CNN), `train.py` stages | `rl-error-estimator` |
 | `old/`: legacy cumulative Gaussian code | `model-based-gaussian` |
 
 Skills live in `.claude/skills/` only (Cursor is no longer used; `.cursor/skills/` was removed). The CNN design plan is at `.cursor/plans/cnn_supervised_training_8ef4d544.plan.md`.
