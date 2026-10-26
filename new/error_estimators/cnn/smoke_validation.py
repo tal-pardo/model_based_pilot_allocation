@@ -34,12 +34,12 @@ from train import (  # noqa: E402
     _channel_mc_for_split,
     collect_snapshots_one_channel,
     load_dataset,
-    load_empirical_sigma,
+    load_sigma_buckets,
+    make_grid,
     rollout_policy_name,
     sample_tdl_channel,
     stack_snapshots,
 )
-from channel_generators.sionna import SionnaOFDMGrid  # noqa: E402
 from utils import resolve_device  # noqa: E402
 
 DET_ATOL = 1e-6
@@ -72,19 +72,19 @@ def cfg_from_meta(meta: Dict[str, Any]) -> CnnTrainConfig:
 
 def rerun_channel_x(
     cfg: CnnTrainConfig,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     split: Literal["train", "val"],
     channel_idx: int,
     device: torch.device,
 ) -> torch.Tensor:
     """Re-run one channel rollout; return stacked X on CPU."""
-    grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+    grid = make_grid(cfg)
     mc = _channel_mc_for_split(split, channel_idx, cfg)
     h_true = sample_tdl_channel(cfg, channel_mc=mc, device=device, grid=grid)
     rows = collect_snapshots_one_channel(
         cfg,
         h_true=h_true,
-        sigma=sigma,
+        sigma_by_bucket=sigma_by_bucket,
         channel_mc=mc,
         channel_idx=channel_idx,
         device=device,
@@ -107,20 +107,28 @@ def check_smoke_guard(
     return CheckResult("smoke_guard", ok, detail)
 
 
+def _grid_shape_from_meta(meta: Dict[str, Any]) -> Tuple[int, int]:
+    """Mirrors train.feature_grid_shape, read from cache meta instead of a live cfg."""
+    if meta.get("domain") == "time_freq":
+        return int(meta["n_symbols"]), int(meta["n_freq_subcarriers"])
+    return int(meta["n_antennas"]), int(meta["n_subcarriers"])
+
+
 def check_dimensions(
     x: torch.Tensor,
     y: torch.Tensor,
     m: torch.Tensor,
     meta: Dict[str, Any],
 ) -> CheckResult:
-    na, nc = int(meta["n_antennas"]), int(meta["n_subcarriers"])
+    nc = int(meta["n_subcarriers"])  # flat candidate count (y_label/loss_mask width)
+    grid_na, grid_nc = _grid_shape_from_meta(meta)
     k0, max_pilots = int(meta["k0"]), int(meta["max_pilots"])
     n_ch = int(meta["n_channels"])
     snaps_per_ch = max_pilots - k0
     expected_d = n_ch * snaps_per_ch
 
     ok = (
-        x.shape == (expected_d, NUM_FEATURE_CHANNELS, na, nc)
+        x.shape == (expected_d, NUM_FEATURE_CHANNELS, grid_na, grid_nc)
         and y.shape == (expected_d, nc)
         and m.shape == (expected_d, nc)
         and int(meta["n_snapshots"]) == expected_d
@@ -128,14 +136,15 @@ def check_dimensions(
     )
     detail = (
         f"X={tuple(x.shape)} y={tuple(y.shape)} loss_mask={tuple(m.shape)} "
-        f"(expected D={expected_d}, [D,6,{na},{nc}])"
+        f"(expected D={expected_d}, X=[D,6,{grid_na},{grid_nc}], y/mask=[D,{nc}])"
     )
     return CheckResult("dimensions", ok, detail)
 
 
 def check_cached_channels_012(x: torch.Tensor, meta: Dict[str, Any]) -> List[CheckResult]:
     """Structural checks on z-scored Ĥ channels (cached data only)."""
-    na, nc = int(meta["n_antennas"]), int(meta["n_subcarriers"])
+    na, nc = _grid_shape_from_meta(meta)
+    time_freq = meta.get("domain") == "time_freq"
     results: List[CheckResult] = []
 
     block = x[:, 0:3]
@@ -155,9 +164,16 @@ def check_cached_channels_012(x: torch.Tensor, meta: Dict[str, Any]) -> List[Che
     max_std_err = 0.0
     for c in range(3):
         plane = x[:, c]
-        max_mean_abs = max(max_mean_abs, plane.mean(dim=2).abs().max().item())
-        std_err = (plane.std(dim=2, unbiased=False) - 1.0).abs().max().item()
-        max_std_err = max(max_std_err, std_err)
+        if time_freq:
+            # zscore_mode="global": normalized jointly over both spatial axes per sample.
+            mean_per_sample = plane.mean(dim=(1, 2))
+            std_per_sample = plane.std(dim=(1, 2), unbiased=False)
+        else:
+            # zscore_mode="per_row": normalized along the subcarrier axis per antenna row.
+            mean_per_sample = plane.mean(dim=2)
+            std_per_sample = plane.std(dim=2, unbiased=False)
+        max_mean_abs = max(max_mean_abs, mean_per_sample.abs().max().item())
+        max_std_err = max(max_std_err, (std_per_sample - 1.0).abs().max().item())
 
     ok_zscore = max_mean_abs <= ZSCORE_MEAN_ATOL and max_std_err <= ZSCORE_STD_ATOL
     results.append(
@@ -174,27 +190,41 @@ def check_cached_channels_012(x: torch.Tensor, meta: Dict[str, Any]) -> List[Che
 
 def check_cached_channels_345(x: torch.Tensor, meta: Dict[str, Any]) -> List[CheckResult]:
     """Internal consistency of mask / SNR / pilot-frac channels (cached data only)."""
-    nc = int(meta["n_subcarriers"])
+    nc = int(meta["n_subcarriers"])  # flat candidate count (pilot-frac denominator)
     sigma2 = float(meta["sigma2"])
+    time_freq = meta.get("domain") == "time_freq"
     expected_snr = math.log10(1.0 / sigma2)
     results: List[CheckResult] = []
 
     mask_plane = x[0, 3]
-    ok_mask_shape = mask_plane.shape == (x.shape[2], nc)
-    row0 = mask_plane[0]
-    ok_broadcast = torch.allclose(mask_plane, row0.unsqueeze(0).expand_as(mask_plane))
     ok_binary = torch.all((mask_plane == 0) | (mask_plane == 1))
     pilot_frac = x[0, 5, 0, 0].item()
-    mask_frac = row0.sum().item() / nc
-    ok_frac = abs(pilot_frac - mask_frac) < DET_ATOL and abs(pilot_frac - 1.0 / nc) < DET_ATOL
-    results.append(
-        CheckResult(
-            "ch3_mask_sample0",
-            ok_mask_shape and ok_broadcast and ok_binary and ok_frac,
-            f"shape={tuple(mask_plane.shape)}, binary={bool(ok_binary)}, "
-            f"broadcast={bool(ok_broadcast)}, frac={pilot_frac:.6g} (expect 1/{nc})",
+    if time_freq:
+        # Genuinely 2D mask (one pilot = one (t,k) cell, not a broadcast) -- cross-check the
+        # pilot-fraction feature against the total count over both axes instead of one row.
+        mask_frac = mask_plane.sum().item() / nc
+        ok_frac = abs(pilot_frac - mask_frac) < DET_ATOL and abs(pilot_frac - 1.0 / nc) < DET_ATOL
+        results.append(
+            CheckResult(
+                "ch3_mask_sample0",
+                bool(ok_binary) and ok_frac,
+                f"shape={tuple(mask_plane.shape)}, binary={bool(ok_binary)}, "
+                f"frac={pilot_frac:.6g} (expect 1/{nc})",
+            )
         )
-    )
+    else:
+        row0 = mask_plane[0]
+        ok_broadcast = torch.allclose(mask_plane, row0.unsqueeze(0).expand_as(mask_plane))
+        mask_frac = row0.sum().item() / nc
+        ok_frac = abs(pilot_frac - mask_frac) < DET_ATOL and abs(pilot_frac - 1.0 / nc) < DET_ATOL
+        results.append(
+            CheckResult(
+                "ch3_mask_sample0",
+                bool(ok_broadcast) and bool(ok_binary) and ok_frac,
+                f"shape={tuple(mask_plane.shape)}, binary={bool(ok_binary)}, "
+                f"broadcast={bool(ok_broadcast)}, frac={pilot_frac:.6g} (expect 1/{nc})",
+            )
+        )
 
     snr_vals = x[:, 4, 0, 0]
     unique_snr = torch.unique(snr_vals)
@@ -216,7 +246,7 @@ def check_cached_channels_345(x: torch.Tensor, meta: Dict[str, Any]) -> List[Che
     for t in range(snaps_per_ch):
         expected = (t + 1) / nc
         pf = block[t, 5, 0, 0].item()
-        mask_frac_t = block[t, 3, 0].sum().item() / nc
+        mask_frac_t = (block[t, 3].sum().item() if time_freq else block[t, 3, 0].sum().item()) / nc
         if abs(pf - expected) > DET_ATOL or abs(mask_frac_t - expected) > DET_ATOL or pf <= prev:
             ok_pf = False
             break
@@ -288,7 +318,7 @@ def check_regenerate_channels_345(
 def check_policy_mix_train(
     x: torch.Tensor,
     cfg: CnnTrainConfig,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     device: torch.device,
     meta: Dict[str, Any],
 ) -> List[CheckResult]:
@@ -317,7 +347,7 @@ def check_policy_mix_train(
             continue
 
         cached_block = x[ch * snaps_per_ch : (ch + 1) * snaps_per_ch]
-        regen = rerun_channel_x(cfg, sigma, "train", ch, device)
+        regen = rerun_channel_x(cfg, sigma_by_bucket, "train", ch, device)
         results.append(
             check_regenerate_channels_345(
                 cached_block, regen, label=f"train_ch{ch}_{expected_policy}"
@@ -332,7 +362,7 @@ def validate_split(
     split: Literal["train", "val"],
     *,
     cfg: CnnTrainConfig,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     device: torch.device,
     expected_n_channels: int,
     check_policies: bool,
@@ -363,13 +393,13 @@ def validate_split(
                 )
             )
         else:
-            regen_ch0 = rerun_channel_x(cfg, sigma, split, 0, device)
+            regen_ch0 = rerun_channel_x(cfg, sigma_by_bucket, split, 0, device)
             results.append(
                 check_regenerate_channels_345(cached_ch0, regen_ch0, label=f"{split}_ch0_{policy}")
             )
 
     if check_policies:
-        results.extend(check_policy_mix_train(x, cfg, sigma, device, meta))
+        results.extend(check_policy_mix_train(x, cfg, sigma_by_bucket, device, meta))
 
     all_ok = True
     for r in results:
@@ -402,10 +432,18 @@ def main() -> None:
         action="store_true",
         help="Skip smoke-only guard (accept any n_channels matching D = n_channels * 31)",
     )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="",
+        help="Cache filename suffix, e.g. '_tf_cf' for a domain='time_freq' counterfactual-mode "
+        "build (see train.label_suffix). Default '' validates the antenna_snapshot current-mode "
+        "train.pt/val.pt.",
+    )
     args = parser.parse_args()
 
-    train_path = args.data_dir / "train.pt"
-    val_path = args.data_dir / "val.pt"
+    train_path = args.data_dir / f"train{args.suffix}.pt"
+    val_path = args.data_dir / f"val{args.suffix}.pt"
     for p in (train_path, val_path):
         if not p.is_file():
             print(f"ERROR: missing {p}", file=sys.stderr)
@@ -416,8 +454,8 @@ def main() -> None:
 
     _, _, _, meta0 = load_dataset(train_path)
     cfg = cfg_from_meta(meta0)
-    print("Loading empirical Sigma for rollout replay (random/fixed policies)...")
-    sigma = load_empirical_sigma(cfg, device)
+    print(f"Loading empirical Sigma bucket(s) for rollout replay (domain={cfg.domain})...")
+    sigma_by_bucket = load_sigma_buckets(cfg, device)
 
     expected_n = args.smoke_n_channels
 
@@ -425,7 +463,7 @@ def main() -> None:
         train_path,
         "train",
         cfg=cfg,
-        sigma=sigma,
+        sigma_by_bucket=sigma_by_bucket,
         device=device,
         expected_n_channels=expected_n,
         check_policies=True,
@@ -435,7 +473,7 @@ def main() -> None:
         val_path,
         "val",
         cfg=cfg,
-        sigma=sigma,
+        sigma_by_bucket=sigma_by_bucket,
         device=device,
         expected_n_channels=expected_n,
         check_policies=False,

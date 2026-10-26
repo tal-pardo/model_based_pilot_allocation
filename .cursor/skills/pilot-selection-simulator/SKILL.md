@@ -46,6 +46,7 @@ Produce `h_true` and (usually) Kronecker `Sigma`; experiments pass both into `ru
 | `jakes.py` | `build_sigma_jakes_kron` (`R_freq ⊗ R_jakes`) | exp7 |
 | `low_rank.py` | `build_sigma_low_rank`, `sample_low_rank_h` | exp7–8 |
 | `block_freq.py` | `build_sigma_block_kron`, block AR(1) clusters | exp9 |
+| `time_freq.py` | `build_sigma_time_freq`, `sample_gaussian_h_time_freq` (thin `gaussian.py` wrappers, antenna axis relabeled time), `flat_index_to_kt`/`kt_to_flat_index` | exp12 prior |
 
 Empirical `Sigma_hat` from `utils.empirical_covariance` on Sionna draws (exp2/3) is a prior choice, not a separate generator.
 
@@ -77,7 +78,7 @@ Estimate MSE without oracle `h_true` — stopping, logging, active scoring.
 
 ### Pilot policy (related axis)
 
-`pilot_policy/`: `fixed`, `random` (exp1, exp10), `repeat` (exp1b: re-measures last init SC), `active` (argmax `J(k)`), `cnn` (`CnnPolicy`, argmin predicted counterfactual NMSE — not registered in `make_policy`, only used directly by `exp11_cnn_allocator.py`; see skill `cnn-error-estimator`). Protocol in `base.py`; `make_policy` in `experiments/common.py` (fixed/random/active/repeat).
+`pilot_policy/`: `fixed`, `random` (exp1, exp10), `repeat` (exp1b: re-measures last init SC), `active` (argmax `J(k)`), `cnn` (`CnnPolicy`, argmin predicted counterfactual NMSE — not registered in `make_policy`, only used directly by `exp11_cnn_allocator.py`; see skill `cnn-error-estimator`), `dmrs_comb` (`DmrsCombPolicy`, NR DM-RS-style frequency comb at fixed OFDM symbols — not registered in `make_policy`, only used directly by `exp12_time_freq_pilots.py` as its `fixed` arm). Protocol in `base.py`; `make_policy` in `experiments/common.py` (fixed/random/active/repeat).
 
 **Plot convention (all figures):** `common.POLICY_STYLES` — fixed `C0` blue `-` circles, random `C1` orange `--` squares, active `C2` green `-.` triangles; full-LMMSE baseline red dotted (`FULL_LMMSE_COLOR`/`FULL_LMMSE_LINESTYLE`). exp3-style true/est overlays: true = solid + marker, est = dotted same color, no marker. Oracle (exp10) purple `P`.
 
@@ -94,6 +95,7 @@ Estimate MSE without oracle `h_true` — stopping, logging, active scoring.
 | exp7 | 4 Gaussians (Toeplitz / Kronecker / Jakes+Rf / low-rank) | matched `Σ` vs identity `I` | LMMSE | trace_min | active |
 | exp8 | low-rank only | est `I`; genie score uses matched `Σ` | LMMSE (+ shadow) | trace_min | active / fixed / genie-active |
 | exp9 | block-cluster Gaussian | matched block `Σ` | LMMSE | trace_min | fixed / active |
+| exp12 | TDL-A time-freq (single antenna) | Kronecker `kron(R_freq, R_time)` (mismatched) | LMMSE | trace_min | fixed / random / active |
 
 When adding features, identify which layer(s) change; keep `run_until_threshold` unless deliberately extending the driver.
 
@@ -106,9 +108,9 @@ When adding features, identify which layer(s) change; keep `run_until_threshold`
 | `new/channel_estimators/` | Layer B |
 | `new/error_estimators/` | Layer C |
 | `new/pilot_policy/` | Subcarrier selection |
-| `new/config.py` | `SimConfig`, `ExpRunConfig`, `Exp1Config`–`Exp9Config` |
+| `new/config.py` | `SimConfig`, `ExpRunConfig`, `Exp1Config`–`Exp10Config`, `Exp12Config` |
 | `new/utils.py` | `resolve_device`, `measure_subcarrier`, `empirical_covariance`, `empirical_nmse` |
-| `new/experiments/` | exp1–exp9, `common.py`, `vis_channels.py` |
+| `new/experiments/` | exp1–exp12, `common.py`, `vis_channels.py` |
 | `new/figures/` | Runtime PNG outputs |
 
 **Imports:** no `__init__.py`; experiment scripts prepend `new/` to `sys.path` → `from simulation import run_until_threshold`.
@@ -244,6 +246,18 @@ Expected: clear mid-horizon gap (active ≪ fixed est/true); curves meet at m=Nc
 
 18 configs (TDL/CDL × A/B/C × 3 delay spreads, 120 kHz SCS), episodes round-robin. One pooled empirical Σ (`n_cov_mc=2000`, `+3_000_000`). `k0=1`, init SC 15 for all arms; `target_pilots=32`; `n_mc=36`. Arms: fixed, random, active, oracle (brute-force true-NMSE argmin, trial noise `+4_000_000`) + full-LMMSE true baseline. Y-axis: mean **true** NMSE vs number of pilots. (Genie per-config Σ arms were removed.)
 
+### exp12 — time-frequency pilot grid (single antenna)
+
+`python new/experiments/exp12_time_freq_pilots.py` · `Exp12Config` · `exp12_time_freq_pilots.png` + `exp12_pilot_pattern.png`
+
+Drops the antenna/space dimension entirely: a "pilot" is one `(subcarrier k, OFDM-symbol t)` resource element over a `Nt`(symbols)`×Nc`(subcarriers) slot, not a whole subcarrier column across antennas. Implemented with **no changes to `simulation.py`/`pilot_policy/`/`error_estimators/`**: `cfg.n_antennas=1` and `cfg.n_subcarriers = Nt*Nc` (flat RE index space), so the existing generic machinery (`measure_subcarrier`, `lmmse_*_update`, `active_subcarrier_score`, all policies) degenerates correctly to scalar per-RE selection — verified by reading each, not assumed. `channel_generators/time_freq.py` is additive: `build_sigma_time_freq`/`sample_gaussian_h_time_freq` thinly wrap `gaussian.py`'s `build_sigma_kron`/`sample_gaussian_h` with the antenna axis relabeled time (`n_antennas=Nt`), giving `Sigma = kron(R_freq, R_time)` whose block layout already matches `sionna.sample_tdl_a_time_freq_channel`'s `H_tf (Nt,Nc)` through the existing `vec_from_h` (column-stacked by subcarrier, each `Nt`-sized block = one SC's symbols) — no change needed there either. `flat_index_to_kt`/`kt_to_flat_index` map the flat index back to `(k,t)` for logging/plotting.
+
+Truth: **TDL-A only** (no Gaussian truth arm) via `sample_tdl_a_time_freq_channel(speed=...)`, `symbol_sampling_frequency=subcarrier_spacing` (one sample per OFDM symbol). Prior: Kronecker `Σ=kron(R_freq,R_time)` (mismatched vs TDL truth, informative unlike exp5's diagonal prior — lets active exploit time/freq correlation). Defaults: `Nt=16`, `Nc=32` (`N=512` REs), `speed=30` m/s (vehicular; matches `vis_channels.py`'s documented "visible decorrelation over 16 symbols" choice), `rho_time=0.85` (AR(1) fit so `rho_time^(Nt-1) ≈` the Jakes `J0` decorrelation at `Nt-1=15` symbol-lags at 30 m/s / 15 kHz SCS / 3.5 GHz — rough physical justification, not a precise Jakes↔AR(1) match), `rho_freq=0.85` (reused default). `k0=2` uniform init over the flat index; `target_pilots=64` (`max_pilots=64`), `n_mc=50`.
+
+Policies: random, active reuse `common.make_policy` unmodified (structure-agnostic/RE-aware respectively, so the flat index doesn't affect them). **`fixed` is exp12-specific: `pilot_policy/dmrs_comb.py`'s `DmrsCombPolicy`**, not `FixedPolicy`'s 1D largest-gap bisection — the bisection doesn't respect the 2D `(k,t)` grid (confirmed via `exp12_pilot_pattern.png`, which visualizes a flat-index bisection collapsing onto a handful of OFDM-symbol rows instead of spreading over the grid). `DmrsCombPolicy` instead mirrors NR PDSCH DM-RS Type 1: a fixed frequency comb (`dmrs_comb_spacing=2`, i.e. every other subcarrier) repeated identically at a handful of fixed OFDM-symbol positions (`dmrs_pilot_symbols=(2,6,10,14)`, evenly spanning the slot — front-loaded symbol + 3 additional symbols for Doppler tracking). `2 (offset) × 16 freqs × 4 symbols = 64 = target_pilots`, so the comb exactly fills the budget with no truncation. Pattern order is time-major (all comb frequencies of the earliest pilot symbol first), so the `k0` bootstrap is a frequency-spread prefix at the front-loaded symbol alone — built via `dmrs_comb_pattern()`, wired in only inside `exp12_time_freq_pilots.py`'s `_make_exp12_policy` (not `common.make_policy`, kept additive/experiment-local). `exp12_pilot_pattern.png` (1×3 scatter of each policy's pilot `(k,t)` positions, colored by selection order) now shows fixed's comb structure directly.
+
+Noise seeds (exp12-only, new block, non-colliding with other experiments' noise offsets): fixed `+0` (reuses the universal fixed=+0 convention), random `+1_210_000`, active `+1_220_000`, full-LMMSE baseline `+1_230_000`. Channel: TDL-A time-freq `seed+100_000+mc` (reuses the established generic "TDL test" draw convention, not exp12-specific).
+
 ### Seed offsets (summary)
 
 | Purpose | Offset |
@@ -263,6 +277,7 @@ Expected: clear mid-horizon gap (active ≪ fixed est/true); curves meet at m=Nc
 | Noise matched+genie / id-active / id-fixed / matched-fixed (exp8) | `+0` / `+10_000` / `+20_000` / `+30_000` |
 | Jakes / low-rank channel (exp7–8) | `seed + 400_000 + mc` / `seed + 500_000 + mc` |
 | Low-rank `B` (exp7–8) | `seed + 3_000_000` |
+| Noise random / active / full-LMMSE (exp12) | `+1_210_000` / `+1_220_000` / `+1_230_000` (fixed reuses `+0`) |
 
 Same `h_true` per trial for fixed vs active; disjoint noise per policy.
 
@@ -280,12 +295,14 @@ Same `h_true` per trial for fixed vs active; disjoint noise per policy.
 - **Jakes** (`jakes.py`): `[R_space]_ij = J_0(2π |i-j| d/λ)`; Kronecker with AR(1) `R_freq` (exp7).
 - **Low-rank** (`low_rank.py`): `h = Bz + √ε w`, `Σ = BB^H + εI`, semi-orthogonal `B` scaled to unit average power (exp7).
 - **Block_freq** (`block_freq.py`): two contiguous SC clusters, AR(1) within (`ρ_intra`), constant cross-cluster `ρ_inter`; `Σ = kron(R_freq, R_space)` (exp9).
+- **Time_freq** (`time_freq.py`): `Σ = kron(R_freq, R_time) + reg·I`, `H_tf = L_time @ Z @ L_freq.T` — `gaussian.py` relabeled (antenna axis → OFDM-symbol/time axis); pairs with `sionna.sample_tdl_a_time_freq_channel` truth over the same flat `(k,t)` index space (exp12).
 
 ## Pilot policies
 
 | Policy | Rule | Exps |
 |--------|------|------|
 | fixed | uniform init + largest-gap bisection | 1–5, 8 (`initial_indices` optional; exp8 uses `[15]`) |
-| random | uniform random unused SC | 1, 10 (`initial_indices` optional; exp10 uses `[15]`) |
+| random | uniform random unused SC | 1, 10, 12 (`initial_indices` optional; exp10 uses `[15]`) |
 | repeat | uniform init, then last init SC every step | 1b |
-| active | greedy argmax `J(k)` | 1–5, 7–8 (`initial_indices` optional; exp7/8 use `[15]`) |
+| active | greedy argmax `J(k)` | 1–5, 7–8, 12 (`initial_indices` optional; exp7/8 use `[15]`) |
+| dmrs_comb (exp12-only `fixed`, `pilot_policy/dmrs_comb.py`) | NR DM-RS-style: fixed frequency comb repeated at fixed OFDM-symbol positions | 12 |

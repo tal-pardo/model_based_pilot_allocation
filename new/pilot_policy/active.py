@@ -5,7 +5,7 @@ from typing import List, Optional, Sequence
 import torch
 
 from channel_estimators.lmmse import EstimatorState
-from error_estimators.trace_min import active_subcarrier_score
+from error_estimators.trace_min import active_scores_all
 from pilot_policy.base import initial_subcarriers_uniform
 
 
@@ -50,11 +50,11 @@ class ActivePolicy:
         return list(self._initial)
 
     def next_subcarrier(self, state: EstimatorState, used: List[int]) -> int:
-        unused = [k for k in range(self._nc) if k not in set(used)]
-        if not unused:
+        used_set = set(used)
+        if len(used_set) >= self._nc:
             raise RuntimeError("ActivePolicy: no unused subcarriers.")
-        best_k = max(
-            unused,
-            key=lambda k: active_subcarrier_score(state, k, self._na, self._sigma2),
-        )
-        return best_k
+        scores = active_scores_all(state, self._na, self._sigma2).clone()
+        if used_set:
+            idx = torch.tensor(sorted(used_set), device=scores.device, dtype=torch.long)
+            scores[idx] = -float("inf")
+        return int(torch.argmax(scores).item())

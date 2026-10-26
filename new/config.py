@@ -133,3 +133,76 @@ class Exp10Config(ExpRunConfig):
     cdl_models: tuple[str, ...] = ("A", "B", "C")
     delay_spreads: tuple[float, ...] = (30e-9, 100e-9, 300e-9)
     n_cov_mc: int = 2000
+
+
+@dataclass
+class Exp12Config(ExpRunConfig):
+    """Time-frequency (OFDM symbol x subcarrier) single-antenna pilot allocation.
+
+    A 'pilot' is one (subcarrier, OFDM-symbol) resource element, not a whole subcarrier
+    column across antennas. Implemented via the existing generic machinery with
+    n_antennas=1 and n_subcarriers=n_symbols*n_freq_subcarriers treated as a flat RE
+    index space (see channel_generators/time_freq.py); n_subcarriers must equal
+    n_symbols * n_freq_subcarriers (checked at runtime, not enforced in __post_init__
+    to keep this a plain dataclass like its siblings).
+    """
+
+    n_antennas: int = 1
+    n_freq_subcarriers: int = 32
+    n_symbols: int = 16
+    n_subcarriers: int = 512  # = n_symbols * n_freq_subcarriers
+    rho_time: float = 0.85
+    speed: float = 30.0
+    target_pilots: Optional[int] = 64
+    max_pilots: int = 64
+    n_mc: int = 50
+    # 'fixed' policy: NR PDSCH DM-RS Type-1-style comb (comb-2 in frequency, repeated at a
+    # front-loaded + 3 additional OFDM symbols) instead of the 1D largest-gap bisection.
+    # comb_spacing=2 x 16 freqs x 4 pilot_symbols = 64 = target_pilots, so the comb exactly
+    # fills the pilot budget with no truncation.
+    dmrs_comb_spacing: int = 2
+    dmrs_pilot_symbols: tuple[int, ...] = (2, 6, 10, 14)
+    dmrs_comb_offset: int = 0
+
+
+@dataclass
+class Exp13Config(ExpRunConfig):
+    """TDL-A time-frequency deployment with an unknown true Sigma.
+
+    Static Ledoit-Wolf shrinkage (floor) vs online covariance inflation vs online SBL
+    delay-Doppler precision update, all starting from one small-sample empirical calibration
+    Sigma_hat_raw, with ActivePolicy reacting to each arm's own evolving covariance belief.
+    Swept across a few speeds (Doppler severity) to check whether method ranking holds across
+    channel dynamics. Reuses exp12's single-antenna time-frequency RE-grid machinery (see
+    channel_generators/time_freq.py); n_subcarriers must equal n_symbols*n_freq_subcarriers.
+    """
+
+    n_antennas: int = 1
+    n_freq_subcarriers: int = 32
+    n_symbols: int = 16
+    n_subcarriers: int = 512  # = n_symbols * n_freq_subcarriers
+    target_pilots: Optional[int] = 64
+    max_pilots: int = 64
+    initial_pilot_subcarriers: int = 2
+    n_mc: int = 50
+    speeds: tuple[float, ...] = (3.0, 30.0, 120.0)
+    n_cov_mc_shrink: int = 64
+    # Arm B: online covariance inflation.
+    inflation_mode: str = "decaying"
+    inflation_factor0: float = 0.05
+    inflation_decay: float = 0.9
+    inflation_eps: float = 1e-4
+    # Arm C: online SBL precision update (delay-Doppler domain). burn-in is deliberately a large
+    # fraction of the pilot budget (N=512 free coefficients is badly under-determined early) and
+    # the rebuilt Sigma is damped toward the previous one rather than fully replacing it, so one
+    # noisy early rebuild can't blow up the estimate (see exp13 plan risk #5).
+    sbl_burn_in_pilots: int = 32
+    sbl_update_every: int = 4
+    sbl_sigma_damping: float = 0.5
+    # alpha_min bounds the max prior variance (1/alpha_min) any single delay-Doppler coefficient
+    # may claim; channel power is unit-normalized, so letting one noisy early estimate claim
+    # variance orders of magnitude above that (the original 1e-6 -> up to 1e6) makes the
+    # posterior solve ill-conditioned in data-starved directions and blows up h_hat.
+    sbl_alpha_min: float = 1e-2
+    sbl_alpha_max: float = 1e8
+    sbl_eps: float = 1e-10

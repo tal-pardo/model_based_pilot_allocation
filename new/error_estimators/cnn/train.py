@@ -42,16 +42,19 @@ _NEW_ROOT = _CNN_DIR.parents[1]
 if str(_NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(_NEW_ROOT))
 
+from channel_estimators.cov_update import ledoit_wolf_shrinkage
 from channel_estimators.lmmse import EstimatorState, lmmse_incremental_update, lmmse_initial_update
 from channel_generators.sionna import (
     SionnaOFDMGrid,
     estimate_empirical_sigma_tdl_a,
     sample_tdl_a_channel,
+    sample_tdl_ofdm_channel,
     vec_from_h,
 )
 from config import ExpRunConfig
 from experiments.common import full_subcarrier_batch_true_mse, make_policy
 from pilot_policy.base import PilotPolicy, initial_subcarriers_uniform
+from pilot_policy.dmrs_comb import DmrsCombPolicy
 from simulation import run_until_threshold
 from utils import complex_standard_normal, measure_subcarrier, resolve_device
 
@@ -68,6 +71,8 @@ EVAL_CHANNEL_OFFSET = 2_000_000
 EVAL_CNN_NOISE_OFFSET = 40_000
 EVAL_FULL_LMMSE_NOISE_OFFSET = 99_999
 GEN_LOG_INTERVAL = 500
+SIGMA_BUCKET_OFFSET = 1_000_000  # time_freq: seed + SIGMA_BUCKET_OFFSET + bucket_stride*idx + k
+SIGMA_BUCKET_STRIDE = 100_000  # per-bucket seed stride, must exceed n_cov_mc_per_bucket
 
 DATA_DIR = _CNN_DIR / "data"
 CHECKPOINT_DIR = _CNN_DIR / "checkpoints"
@@ -101,6 +106,19 @@ class CnnTrainConfig:
     eval_n_mc: int = 100
     label_mode: Literal["current", "counterfactual"] = "current"
     early_stop_patience: Optional[int] = None
+    # domain="time_freq" only (no-ops under the default "antenna_snapshot"): single-antenna,
+    # joint time-freq grid (n_symbols OFDM symbols x n_freq_subcarriers), swept over
+    # tdl_models x speeds buckets, with the DMRS-comb "fixed" baseline instead of the generic
+    # 1D bisection (see pilot_policy.dmrs_comb). domain="time_freq" forces n_antennas=1 and
+    # n_subcarriers=n_symbols*n_freq_subcarriers (see _check_domain_config).
+    domain: Literal["antenna_snapshot", "time_freq"] = "antenna_snapshot"
+    n_freq_subcarriers: int = 32
+    n_symbols: int = 16
+    tdl_models: Tuple[str, ...] = ("A", "B", "C")
+    speeds: Tuple[float, ...] = (3.0, 30.0, 120.0)
+    n_cov_mc_per_bucket: int = 256
+    dmrs_comb_spacing: int = 2
+    dmrs_pilot_symbols: Tuple[int, ...] = (2, 6, 10, 14)
 
     @property
     def n_total(self) -> int:
@@ -129,6 +147,51 @@ class CnnTrainConfig:
         )
 
 
+def _check_domain_config(cfg: "CnnTrainConfig") -> None:
+    """domain='time_freq' requires n_antennas=1 (pilot = one (k,t) RE) and n_subcarriers to be
+    the flat n_symbols*n_freq_subcarriers index space (mirrors exp12/13's _check_config)."""
+    if cfg.domain != "time_freq":
+        return
+    if cfg.n_antennas != 1:
+        raise ValueError("domain='time_freq' requires n_antennas=1.")
+    expected_n = cfg.n_symbols * cfg.n_freq_subcarriers
+    if cfg.n_subcarriers != expected_n:
+        raise ValueError(
+            f"domain='time_freq': n_subcarriers ({cfg.n_subcarriers}) must equal "
+            f"n_symbols*n_freq_subcarriers ({cfg.n_symbols}*{cfg.n_freq_subcarriers}={expected_n})."
+        )
+
+
+def feature_grid_shape(cfg: "CnnTrainConfig") -> Tuple[int, int]:
+    """Output: (na,nc) to pass to h_hat_to_H/build_features/CNNErrorEstimator -- the h_hat
+    block layout (vec_from_h convention) to reshape into a 2D grid for the CNN. antenna_snapshot:
+    the grid IS (n_antennas,n_subcarriers). time_freq: the grid is (n_symbols,n_freq_subcarriers)
+    -- distinct from the flat (n_antennas=1, n_subcarriers=n_symbols*n_freq_subcarriers) candidate
+    indexing used by labels/LMMSE/policies, since vec_from_h's actual block size for a time-freq
+    channel is n_symbols (one subcarrier's time samples), not 1."""
+    if cfg.domain == "time_freq":
+        return cfg.n_symbols, cfg.n_freq_subcarriers
+    return cfg.n_antennas, cfg.n_subcarriers
+
+
+def zscore_mode_for(cfg: "CnnTrainConfig") -> Literal["per_row", "global"]:
+    return "global" if cfg.domain == "time_freq" else "per_row"
+
+
+def mask_to_grid(mask_flat: torch.Tensor, cfg: "CnnTrainConfig") -> torch.Tensor:
+    """Input: flat (nc,) pilot-used mask, nc=cfg.n_subcarriers. Output: 2D mask matching
+    feature_grid_shape(cfg)'s grid convention. antenna_snapshot: one subcarrier pilot reveals
+    all n_antennas at once, so the flat per-subcarrier mask is broadcast across antenna rows
+    (unchanged from before). time_freq: one pilot reveals exactly one (symbol,subcarrier) cell,
+    so the mask is reshaped (not broadcast) into the genuine 2D grid via the same vec_from_h
+    block convention as h_hat_to_H -- strictly more informative than a broadcast."""
+    if cfg.domain == "time_freq":
+        nt, nc_freq = cfg.n_symbols, cfg.n_freq_subcarriers
+        return mask_flat.view(nc_freq, nt).T.contiguous()
+    na, nc = cfg.n_antennas, cfg.n_subcarriers
+    return mask_flat.view(1, nc).expand(na, nc)
+
+
 # ---------------------------------------------------------------------------
 # 3. build_features
 # ---------------------------------------------------------------------------
@@ -138,8 +201,18 @@ def h_hat_to_H(h_hat: torch.Tensor, na: int, nc: int) -> torch.Tensor:
     return h.view(nc, na).T.contiguous()
 
 
-def zscore_across_nc(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Input: (Na,Nc). Output: z-scored along subcarrier dim per antenna row."""
+def zscore_across_nc(
+    x: torch.Tensor, eps: float = 1e-8, *, mode: Literal["per_row", "global"] = "per_row"
+) -> torch.Tensor:
+    """Input: (Na,Nc). Output: z-scored, either along the subcarrier dim per row ("per_row",
+    antenna-domain default: antennas are exchangeable, no cross-row structure to preserve) or
+    jointly over both axes ("global", time-freq domain: both axes carry sample-varying
+    structure -- frequency-selectivity differs by TDL model, time-selectivity by speed -- and
+    normalizing along either axis alone would flatten out exactly that structure)."""
+    if mode == "global":
+        mu = x.mean()
+        std = x.std(unbiased=False).clamp(min=eps)
+        return (x - mu) / std
     mu = x.mean(dim=1, keepdim=True)
     std = x.std(dim=1, keepdim=True, unbiased=False).clamp(min=eps)
     return (x - mu) / std
@@ -147,22 +220,30 @@ def zscore_across_nc(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def build_features(
     h_hat: torch.Tensor,
-    mask: torch.Tensor,
+    mask_2d: torch.Tensor,
     n_pilots: int,
     sigma2: float,
     *,
     na: int,
     nc: int,
+    n_candidates: Optional[int] = None,
+    zscore_mode: Literal["per_row", "global"] = "per_row",
 ) -> torch.Tensor:
-    """Input: h_hat (N,1), mask (Nc,), n_pilots, sigma2. Output: (6, Na, Nc) float32."""
+    """Input: h_hat (N,1), mask_2d (Na,Nc) (already broadcast/reshaped by the caller via
+    mask_to_grid), n_pilots, sigma2. na/nc: h_hat's reshape grid (see feature_grid_shape).
+    n_candidates: total flat candidate count for the pilot-fraction feature's denominator;
+    defaults to nc, correct only when the grid IS the flat candidate space (antenna_snapshot,
+    where grid_nc==cfg.n_subcarriers) -- must be passed explicitly otherwise (time_freq, where
+    nc=n_freq_subcarriers but there are n_symbols*n_freq_subcarriers total flat candidates).
+    Output: (6, Na, Nc) float32."""
     h_mat = h_hat_to_H(h_hat, na, nc)
-    re = zscore_across_nc(h_mat.real)
-    im = zscore_across_nc(h_mat.imag)
-    mag = zscore_across_nc(h_mat.abs())
+    re = zscore_across_nc(h_mat.real, mode=zscore_mode)
+    im = zscore_across_nc(h_mat.imag, mode=zscore_mode)
+    mag = zscore_across_nc(h_mat.abs(), mode=zscore_mode)
 
-    mask_2d = mask.view(1, nc).expand(na, nc)
+    n_cand = n_candidates if n_candidates is not None else nc
     snr = math.log10(1.0 / sigma2)
-    pilot_frac = float(n_pilots) / float(nc)
+    pilot_frac = float(n_pilots) / float(n_cand)
     snr_t = torch.full((na, nc), snr, dtype=torch.float32, device=mag.device)
     pf_t = torch.full((na, nc), pilot_frac, dtype=torch.float32, device=mag.device)
 
@@ -194,8 +275,12 @@ def block_error_labels(
 
 
 def label_suffix(cfg: "CnnTrainConfig") -> str:
-    """Input: config. Output: '_cf' for counterfactual label mode, else ''."""
-    return "_cf" if cfg.label_mode == "counterfactual" else ""
+    """Input: config. Output: '_tf' for domain='time_freq', then '_cf' for counterfactual
+    label mode (either, both, or neither)."""
+    suffix = "_tf" if cfg.domain == "time_freq" else ""
+    if cfg.label_mode == "counterfactual":
+        suffix += "_cf"
+    return suffix
 
 
 def counterfactual_labels(
@@ -262,34 +347,68 @@ def counterfactual_labels(
 # 5. CNNErrorEstimator
 # ---------------------------------------------------------------------------
 class CNNErrorEstimator(nn.Module):
-    """2D CNN: (B, 6, Na, Nc) → (B, Nc) log block-error predictions."""
+    """2D CNN: (B, 6, H, W) → (B, Nc) log error predictions.
 
-    def __init__(self, n_subcarriers: int = 32) -> None:
+    pool_mode="mean" (antenna_snapshot domain): H is a nuisance axis (e.g. antennas) averaged
+    away, one score per W=Nc candidate. pool_mode="per_cell" (time_freq domain): every (H,W)
+    cell is its own independent pilot candidate, so no axis is pooled; the (H,W) score grid is
+    instead flattened subcarrier-major (W major, H minor: s=w*H+h) to match vec_from_h's block
+    convention -- requires H=n_symbols, W=n_freq_subcarriers at the input (see feature_grid_shape).
+    """
+
+    def __init__(
+        self,
+        n_subcarriers: int = 32,
+        pool_mode: Literal["mean", "per_cell"] = "mean",
+        kernel_hw: Tuple[int, int] = (3, 5),
+    ) -> None:
         super().__init__()
         self.n_subcarriers = n_subcarriers
+        self.pool_mode = pool_mode
+        kh, kw = kernel_hw
+        ph, pw = kh // 2, kw // 2
         self.conv2d = nn.Sequential(
             nn.Conv2d(6, 32, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            nn.Conv2d(32, 32, kernel_size=(kh, kw), padding=(ph, pw), bias=False),
             nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            nn.Conv2d(32, 32, kernel_size=(kh, kw), padding=(ph, pw), bias=False),
             nn.GroupNorm(8, 32),
             nn.GELU(),
         )
-        self.head = nn.Sequential(
-            nn.Conv1d(32, 16, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-        )
+        if pool_mode == "mean":
+            self.head = nn.Sequential(
+                nn.Conv1d(32, 16, kernel_size=1),
+                nn.GELU(),
+                nn.Conv1d(16, 1, kernel_size=1),
+            )
+        elif pool_mode == "per_cell":
+            self.head = nn.Sequential(
+                nn.Conv2d(32, 16, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(16, 1, kernel_size=1),
+            )
+        else:
+            raise ValueError(f"Unknown pool_mode: {pool_mode!r}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Input: (B, 6, Na, Nc). Output: (B, Nc)."""
+        """Input: (B, 6, H, W). Output: (B, Nc)."""
         h = self.conv2d(x)
-        h = h.mean(dim=2)
-        h = self.head(h)
-        return h.squeeze(1)
+        if self.pool_mode == "mean":
+            h = h.mean(dim=2)
+            h = self.head(h)
+            return h.squeeze(1)
+        h = self.head(h).squeeze(1)  # (B,H,W)
+        return h.permute(0, 2, 1).reshape(h.shape[0], -1)  # (B,W,H) -> flat w*H+h
+
+
+def model_arch_kwargs(cfg: "CnnTrainConfig") -> Dict[str, Any]:
+    """Output: CNNErrorEstimator kwargs appropriate for cfg.domain (see class docstring)."""
+    if cfg.domain == "time_freq":
+        return {"pool_mode": "per_cell", "kernel_hw": (3, 3)}
+    return {"pool_mode": "mean", "kernel_hw": (3, 5)}
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +434,17 @@ def masked_huber_loss(
     return per_sample.mean()
 
 
-def unused_mask_from_features(x: torch.Tensor) -> torch.Tensor:
-    """Input: (B, 6, Na, Nc). Output: (B, Nc) float, 1 on unused (unpiloted) subcarriers."""
+def unused_mask_from_features(
+    x: torch.Tensor, *, domain: Literal["antenna_snapshot", "time_freq"] = "antenna_snapshot"
+) -> torch.Tensor:
+    """Input: (B, 6, H, W). Output: (B, Nc) float, 1 on unused (unpiloted) candidates.
+    antenna_snapshot: mask channel is constant across H (broadcast), any row works, flat Nc=W.
+    time_freq: mask channel is genuinely 2D (no broadcast), so the full plane must be flattened
+    the same way the per_cell head flattens its scores (W major, H minor: s=w*H+h), else the
+    mask wouldn't align with model predictions / y_label's flat ordering."""
+    if domain == "time_freq":
+        m = (x[:, 3, :, :] < 0.5).to(dtype=torch.float32)  # (B,H,W)
+        return m.permute(0, 2, 1).reshape(m.shape[0], -1)  # (B,W,H) -> flat w*H+h
     return (x[:, 3, 0, :] < 0.5).to(dtype=torch.float32)
 
 
@@ -345,9 +473,17 @@ def val_top1_unused(
 # ---------------------------------------------------------------------------
 # 7. estimate_sigma
 # ---------------------------------------------------------------------------
+def make_grid(cfg: CnnTrainConfig) -> SionnaOFDMGrid:
+    """Output: the OFDM grid for this domain -- fft_size is the actual number of frequency
+    subcarriers modeled (n_freq_subcarriers in time_freq mode, not the flat n_subcarriers)."""
+    if cfg.domain == "time_freq":
+        return SionnaOFDMGrid(fft_size=cfg.n_freq_subcarriers)
+    return SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+
+
 def load_empirical_sigma(cfg: CnnTrainConfig, device: torch.device, *, n_cov_mc: int | None = None) -> torch.Tensor:
     """Input: config, device. Output: (N,N) empirical Sigma from TDL-A."""
-    grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+    grid = make_grid(cfg)
     n_mc = n_cov_mc if n_cov_mc is not None else cfg.n_cov_mc
     t0 = time.perf_counter()
     sigma = estimate_empirical_sigma_tdl_a(
@@ -356,15 +492,65 @@ def load_empirical_sigma(cfg: CnnTrainConfig, device: torch.device, *, n_cov_mc:
         rho_space=cfg.rho_space,
         n_cov_mc=n_mc,
         seed=cfg.seed,
-        seed_offset=1_000_000,
+        seed_offset=SIGMA_BUCKET_OFFSET,
         reg_empirical=cfg.reg_empirical,
         grid=grid,
         device=device,
         dtype=cfg.dtype,
     )
     elapsed = time.perf_counter() - t0
-    print(f"Empirical Sigma: n_cov_mc={n_mc}, seed_offset=1_000_000, elapsed={elapsed:.1f}s")
+    print(f"Empirical Sigma: n_cov_mc={n_mc}, seed_offset={SIGMA_BUCKET_OFFSET}, elapsed={elapsed:.1f}s")
     return sigma
+
+
+def tdl_buckets(cfg: CnnTrainConfig) -> List[Tuple[str, float]]:
+    """time_freq only: the (model,speed) sweep, e.g. 3 models x 3 speeds = 9 buckets."""
+    return [(m, s) for m in cfg.tdl_models for s in cfg.speeds]
+
+
+def bucket_for_channel(cfg: CnnTrainConfig, channel_mc: int) -> Tuple[str, float]:
+    """time_freq only: round-robins (model,speed) buckets the same way POLICY_NAMES cycles by
+    channel_idx % 3 for the policy mix (not required to be phase-aligned with it)."""
+    buckets = tdl_buckets(cfg)
+    return buckets[channel_mc % len(buckets)]
+
+
+def load_sigma_buckets(cfg: CnnTrainConfig, device: torch.device) -> Dict[Tuple[str, float], torch.Tensor]:
+    """Input: config, device. Output: {(model,speed): Sigma}. antenna_snapshot: single-entry
+    dict via today's load_empirical_sigma (unchanged numerics). time_freq: one Ledoit-Wolf-shrunk
+    Sigma per (model,speed) bucket (reg via cfg.reg_empirical), each from cfg.n_cov_mc_per_bucket
+    draws of that bucket's own TDL model/speed -- needed because a single shared Sigma (today's
+    scheme) would be statistically mismatched for every channel whose true (model,speed)
+    second-order statistics differ from whatever single setting it was estimated under."""
+    if cfg.domain != "time_freq":
+        return {("A", 0.0): load_empirical_sigma(cfg, device)}
+
+    grid = make_grid(cfg)
+    buckets = tdl_buckets(cfg)
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor] = {}
+    t0 = time.perf_counter()
+    for bucket_idx, (model, speed) in enumerate(buckets):
+        samples = torch.zeros((cfg.n_cov_mc_per_bucket, cfg.n_subcarriers), device=device, dtype=cfg.dtype)
+        for k in range(cfg.n_cov_mc_per_bucket):
+            h_tf = sample_tdl_ofdm_channel(
+                model=model,
+                n_ofdm_symbols=cfg.n_symbols,
+                n_subcarriers=cfg.n_freq_subcarriers,
+                grid=grid,
+                device=device,
+                n_antennas=1,
+                speed=speed,
+                symbol_sampling_frequency=grid.subcarrier_spacing,
+                dtype=cfg.dtype,
+                seed=cfg.seed + SIGMA_BUCKET_OFFSET + bucket_idx * SIGMA_BUCKET_STRIDE + k,
+            )
+            samples[k] = vec_from_h(h_tf).squeeze(-1)
+        sigma, delta = ledoit_wolf_shrinkage(samples, reg=cfg.reg_empirical, device=device, dtype=cfg.dtype)
+        sigma_by_bucket[(model, speed)] = sigma
+        print(f"  Sigma bucket model={model} speed={speed:g}: n_cov_mc={cfg.n_cov_mc_per_bucket}, delta={delta:.3f}")
+    elapsed = time.perf_counter() - t0
+    print(f"Empirical Sigma buckets: {len(buckets)} buckets, elapsed={elapsed:.1f}s")
+    return sigma_by_bucket
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +578,21 @@ def sample_tdl_channel(
     grid: SionnaOFDMGrid,
 ) -> torch.Tensor:
     """Input: channel index mc. Output: h_true (N,1)."""
+    if cfg.domain == "time_freq":
+        model, speed = bucket_for_channel(cfg, channel_mc)
+        h_tf = sample_tdl_ofdm_channel(
+            model=model,
+            n_ofdm_symbols=cfg.n_symbols,
+            n_subcarriers=cfg.n_freq_subcarriers,
+            grid=grid,
+            device=device,
+            n_antennas=1,
+            speed=speed,
+            symbol_sampling_frequency=grid.subcarrier_spacing,
+            dtype=cfg.dtype,
+            seed=cfg.seed + TDL_CHANNEL_OFFSET + channel_mc,
+        )
+        return vec_from_h(h_tf)
     h_mat = sample_tdl_a_channel(
         n_antennas=cfg.n_antennas,
         n_subcarriers=cfg.n_subcarriers,
@@ -404,11 +605,37 @@ def sample_tdl_channel(
     return vec_from_h(h_mat)
 
 
+def _make_policy(
+    name: str, cfg: CnnTrainConfig, device: torch.device, *, seed: int, channel_mc: int
+) -> PilotPolicy:
+    """'fixed' -> DmrsCombPolicy in time_freq domain (the generic 1D largest-gap bisection
+    doesn't respect the 2D (k,t) grid, see pilot_policy.dmrs_comb); comb_offset varies per
+    channel so 'fixed' rollouts aren't bit-identical across channels (DmrsCombPolicy has no
+    seed of its own). Otherwise falls through to experiments.common.make_policy unchanged in
+    both domains (random/active already proven domain-agnostic by exp12)."""
+    if name == "fixed" and cfg.domain == "time_freq":
+        comb_offset = channel_mc % cfg.dmrs_comb_spacing
+        return DmrsCombPolicy(
+            n_subcarriers=cfg.n_subcarriers,
+            n_antennas=cfg.n_antennas,
+            initial_pilot_subcarriers=cfg.k0,
+            max_pilots=cfg.max_pilots,
+            device=device,
+            n_freq_subcarriers=cfg.n_freq_subcarriers,
+            n_symbols=cfg.n_symbols,
+            comb_spacing=cfg.dmrs_comb_spacing,
+            pilot_symbols=cfg.dmrs_pilot_symbols,
+            comb_offset=comb_offset,
+        )
+    run_cfg = cfg.to_run_config()
+    return make_policy(name, run_cfg, device, seed=seed)
+
+
 def collect_snapshots_one_channel(
     cfg: CnnTrainConfig,
     *,
     h_true: torch.Tensor,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     channel_mc: int,
     channel_idx: int,
     device: torch.device,
@@ -416,12 +643,15 @@ def collect_snapshots_one_channel(
     """Incremental rollout; returns list of (X, y_label, loss_mask) per decision step."""
     na, nc = cfg.n_antennas, cfg.n_subcarriers
     n = cfg.n_total
+    grid_na, grid_nc = feature_grid_shape(cfg)
+    zscore_mode = zscore_mode_for(cfg)
+    bucket = bucket_for_channel(cfg, channel_mc) if cfg.domain == "time_freq" else ("A", 0.0)
+    sigma = sigma_by_bucket[bucket]
     policy_name = rollout_policy_name(channel_idx)
     channel_seed = tdl_channel_seed(cfg, channel_mc)
     noise_seed = cfg.seed + NOISE_OFFSET[policy_name] + channel_mc
 
-    run_cfg = cfg.to_run_config()
-    policy = make_policy(policy_name, run_cfg, device, seed=noise_seed)
+    policy = _make_policy(policy_name, cfg, device, seed=noise_seed, channel_mc=channel_mc)
     policy.reset()
 
     k_init = random_first_subcarrier(channel_seed, nc)
@@ -438,7 +668,11 @@ def collect_snapshots_one_channel(
 
     rows: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     while n_pilots < cfg.max_pilots:
-        x_feat = build_features(state.h_hat, mask, n_pilots, cfg.sigma2, na=na, nc=nc)
+        mask_2d = mask_to_grid(mask, cfg)
+        x_feat = build_features(
+            state.h_hat, mask_2d, n_pilots, cfg.sigma2,
+            na=grid_na, nc=grid_nc, n_candidates=nc, zscore_mode=zscore_mode,
+        )
         if cfg.label_mode == "counterfactual":
             y_lab = counterfactual_labels(
                 state, h_true, used, na, nc, cfg.sigma2, gen, label_eps=cfg.label_eps
@@ -510,7 +744,8 @@ def collect_snapshots_bootstrap_mixed_k0(
     cnn_model.eval()
     with torch.no_grad():
         while n_pilots < cfg.max_pilots:
-            x_feat = build_features(state.h_hat, mask, n_pilots, cfg.sigma2, na=na, nc=nc)
+            mask_2d = mask.view(1, nc).expand(na, nc)
+            x_feat = build_features(state.h_hat, mask_2d, n_pilots, cfg.sigma2, na=na, nc=nc)
             y_lab = block_error_labels(state.h_hat, h_true, na, nc, label_eps=cfg.label_eps)
             loss_mask = torch.ones(nc, device=device, dtype=torch.float32)
             rows.append((x_feat, y_lab, loss_mask))
@@ -563,14 +798,14 @@ def build_dataset_cache(
     *,
     split: Literal["train", "val"],
     device: torch.device,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     n_channels: Optional[int] = None,
     out_path: Optional[Path] = None,
 ) -> Path:
     """Generate and save data/{split}.pt."""
     n_ch = n_channels if n_channels is not None else _n_channels_for_split(split, cfg)
     out = out_path or (DATA_DIR / f"{split}{label_suffix(cfg)}.pt")
-    grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+    grid = make_grid(cfg)
 
     print(f"build {split}: {n_ch} channels, device={device}")
     all_rows: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
@@ -580,7 +815,7 @@ def build_dataset_cache(
         mc = _channel_mc_for_split(split, ch, cfg)
         h_true = sample_tdl_channel(cfg, channel_mc=mc, device=device, grid=grid)
         rows = collect_snapshots_one_channel(
-            cfg, h_true=h_true, sigma=sigma, channel_mc=mc, channel_idx=ch, device=device
+            cfg, h_true=h_true, sigma_by_bucket=sigma_by_bucket, channel_mc=mc, channel_idx=ch, device=device
         )
         all_rows.extend(rows)
         if (ch + 1) % GEN_LOG_INTERVAL == 0 or ch + 1 == n_ch:
@@ -595,6 +830,10 @@ def build_dataset_cache(
         "n_snapshots": int(x.shape[0]),
         "feature_channels": NUM_FEATURE_CHANNELS,
     }
+    if cfg.domain == "time_freq":
+        meta["bucket_assignment"] = [
+            list(bucket_for_channel(cfg, _channel_mc_for_split(split, ch, cfg))) for ch in range(n_ch)
+        ]
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     torch.save({"X": x.cpu(), "y_label": y.cpu(), "loss_mask": m.cpu(), "meta": meta}, out)
     print(f"Saved {out}: X={tuple(x.shape)}, y_label={tuple(y.shape)}, loss_mask={tuple(m.shape)}")
@@ -617,6 +856,7 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     huber_delta: float,
     train: bool,
+    domain: Literal["antenna_snapshot", "time_freq"] = "antenna_snapshot",
 ) -> Tuple[float, float]:
     if train:
         model.train()
@@ -630,7 +870,7 @@ def run_epoch(
     for x_b, y_b, _m_b in loader:
         x_b = x_b.to(device)
         y_b = y_b.to(device)
-        unused_mask = unused_mask_from_features(x_b)
+        unused_mask = unused_mask_from_features(x_b, domain=domain)
 
         if train and optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
@@ -669,7 +909,8 @@ def train_loop(
         TensorDataset(x_va, y_va, m_va), batch_size=cfg.batch_size, shuffle=False, num_workers=0
     )
 
-    model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers).to(device)
+    arch_kwargs = model_arch_kwargs(cfg)
+    model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers, **arch_kwargs).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     best_val = float("inf")
@@ -681,14 +922,18 @@ def train_loop(
     print(
         f"train: device={device}, train={len(x_tr)} val={len(x_va)} "
         f"batch={cfg.batch_size}, max_epochs={cfg.max_epochs}, label_mode={cfg.label_mode}, "
-        f"loss=unused-SC Huber (per-sample mean)"
+        f"domain={cfg.domain}, loss=unused-SC Huber (per-sample mean)"
     )
 
     for epoch in range(1, cfg.max_epochs + 1):
         t0 = time.perf_counter()
-        train_huber, _ = run_epoch(model, train_loader, device=device, optimizer=opt, huber_delta=cfg.huber_delta, train=True)
+        train_huber, _ = run_epoch(
+            model, train_loader, device=device, optimizer=opt, huber_delta=cfg.huber_delta,
+            train=True, domain=cfg.domain,
+        )
         val_huber, val_top1 = run_epoch(
-            model, val_loader, device=device, optimizer=None, huber_delta=cfg.huber_delta, train=False
+            model, val_loader, device=device, optimizer=None, huber_delta=cfg.huber_delta,
+            train=False, domain=cfg.domain,
         )
         elapsed = time.perf_counter() - t0
         star = ""
@@ -706,7 +951,12 @@ def train_loop(
                     "best_epoch": best_epoch,
                     "best_val_huber": best_val,
                     "best_val_top1": best_top1,
-                    "arch": {"class": "CNNErrorEstimator", "n_subcarriers": cfg.n_subcarriers},
+                    "arch": {
+                        "class": "CNNErrorEstimator",
+                        "n_subcarriers": cfg.n_subcarriers,
+                        "pool_mode": arch_kwargs["pool_mode"],
+                        "kernel_hw": list(arch_kwargs["kernel_hw"]),
+                    },
                 },
                 checkpoint_path,
             )
@@ -739,8 +989,11 @@ def train_loop(
 # ---------------------------------------------------------------------------
 def load_cnn_checkpoint(path: Path, device: torch.device) -> CNNErrorEstimator:
     blob = torch.load(path, map_location=device, weights_only=False)
-    nc = int(blob.get("arch", {}).get("n_subcarriers", 32))
-    model = CNNErrorEstimator(n_subcarriers=nc).to(device)
+    arch = blob.get("arch", {})
+    nc = int(arch.get("n_subcarriers", 32))
+    pool_mode = arch.get("pool_mode", "mean")
+    kernel_hw = tuple(arch.get("kernel_hw", (3, 5)))
+    model = CNNErrorEstimator(n_subcarriers=nc, pool_mode=pool_mode, kernel_hw=kernel_hw).to(device)
     model.load_state_dict(blob["model_state_dict"])
     return model
 
@@ -775,18 +1028,19 @@ class CnnPilotPolicy:
         self,
         model: CNNErrorEstimator,
         *,
-        na: int,
-        nc: int,
-        sigma2: float,
+        cfg: CnnTrainConfig,
         device: torch.device,
         select_mode: Literal["argmax", "argmin"] = "argmax",
     ) -> None:
         self._model = model
-        self._na = na
-        self._nc = nc
-        self._sigma2 = sigma2
+        self._cfg = cfg
+        self._na = cfg.n_antennas
+        self._nc = cfg.n_subcarriers
+        self._sigma2 = cfg.sigma2
         self._device = device
         self._select_mode = select_mode
+        self._grid_na, self._grid_nc = feature_grid_shape(cfg)
+        self._zscore_mode = zscore_mode_for(cfg)
 
     def reset(self) -> None:
         pass
@@ -808,7 +1062,11 @@ class CnnPilotPolicy:
         n_pilots: int,
     ) -> int:
         self._model.eval()
-        x = build_features(state.h_hat, mask, n_pilots, self._sigma2, na=self._na, nc=self._nc)
+        mask_2d = mask_to_grid(mask, self._cfg)
+        x = build_features(
+            state.h_hat, mask_2d, n_pilots, self._sigma2,
+            na=self._grid_na, nc=self._grid_nc, n_candidates=self._nc, zscore_mode=self._zscore_mode,
+        )
         with torch.no_grad():
             pred = self._model(x.unsqueeze(0)).squeeze(0)
         scores = pred.clone()
@@ -831,8 +1089,11 @@ def run_closed_loop_mse_curve(
     policy_mode: Literal["cnn", "fixed", "active"],
     cnn_model: Optional[CNNErrorEstimator] = None,
 ) -> List[float]:
-    """Return average MSE after each pilot count (length max_pilots) via run_until_threshold."""
-    na, nc = cfg.n_antennas, cfg.n_subcarriers
+    """Return average MSE after each pilot count (length max_pilots) via run_until_threshold.
+    sigma is the single Sigma to use for this channel -- the caller resolves which bucket's
+    Sigma that is (eval_phase1b: the one antenna-domain Sigma; eval_phase1b_time_freq: that
+    channel's own (model,speed) bucket)."""
+    nc = cfg.n_subcarriers
     run_cfg = cfg.to_eval_run_config()
     channel_seed = tdl_channel_seed(cfg, channel_mc)
     k_init = random_first_subcarrier(channel_seed, nc)
@@ -842,15 +1103,13 @@ def run_closed_loop_mse_curve(
             raise ValueError("cnn policy requires model")
         noise_seed = cfg.seed + EVAL_CNN_NOISE_OFFSET + channel_mc
         select_mode = "argmin" if cfg.label_mode == "counterfactual" else "argmax"
-        inner: PilotPolicy = CnnPilotPolicy(
-            cnn_model, na=na, nc=nc, sigma2=cfg.sigma2, device=device, select_mode=select_mode
-        )
+        inner: PilotPolicy = CnnPilotPolicy(cnn_model, cfg=cfg, device=device, select_mode=select_mode)
     elif policy_mode == "fixed":
         noise_seed = cfg.seed + NOISE_OFFSET["fixed"] + channel_mc
-        inner = make_policy("fixed", run_cfg, device, seed=noise_seed)
+        inner = _make_policy("fixed", cfg, device, seed=noise_seed, channel_mc=channel_mc)
     else:
         noise_seed = cfg.seed + NOISE_OFFSET["active"] + channel_mc
-        inner = make_policy("active", run_cfg, device, seed=noise_seed)
+        inner = _make_policy("active", cfg, device, seed=noise_seed, channel_mc=channel_mc)
 
     policy = _FixedInitPilotPolicy(k_init, inner)
     gen = torch.Generator(device=device).manual_seed(noise_seed)
@@ -864,7 +1123,7 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
 
     device = resolve_device(cfg.device)
     model = load_cnn_checkpoint(checkpoint_path, device)
-    grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+    grid = make_grid(cfg)
     sigma = load_empirical_sigma(cfg, device)
 
     curves: Dict[str, List[List[float]]] = {"cnn": [], "fixed": [], "active": []}
@@ -933,6 +1192,108 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
     for name, curve in mean_curves.items():
         print(f"  {name} @ n_pilots=32: {curve[-1]:.6e}")
     print(f"  full LMMSE: {full_mse:.6e}")
+
+
+def eval_phase1b_time_freq(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
+    """Phase 1b eval for domain='time_freq': a 3x3 (tdl_models x speeds) grid of panels, each
+    with its own cnn/fixed/active/full-LMMSE curves -- a single pooled curve (as in
+    eval_phase1b) would hide whether the CNN generalizes evenly across buckets or just wins on
+    whichever it saw most."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    device = resolve_device(cfg.device)
+    model = load_cnn_checkpoint(checkpoint_path, device)
+    grid = make_grid(cfg)
+    sigma_by_bucket = load_sigma_buckets(cfg, device)
+
+    suffix = label_suffix(cfg)
+    pilots = np.arange(1, cfg.max_pilots + 1)
+    n_models, n_speeds = len(cfg.tdl_models), len(cfg.speeds)
+    fig, axes = plt.subplots(
+        n_models, n_speeds, figsize=(5.0 * n_speeds, 4.0 * n_models), squeeze=False
+    )
+    payload: Dict[str, Any] = {"n_mc": cfg.eval_n_mc, "checkpoint": str(checkpoint_path), "pilots": pilots.tolist(), "buckets": {}}
+
+    print(f"eval phase1b (time_freq): n_mc={cfg.eval_n_mc}/bucket, {n_models}x{n_speeds} buckets, checkpoint={checkpoint_path}")
+    for bi, model_name in enumerate(cfg.tdl_models):
+        for si, speed in enumerate(cfg.speeds):
+            sigma = sigma_by_bucket[(model_name, speed)]
+            curves: Dict[str, List[List[float]]] = {"cnn": [], "fixed": [], "active": []}
+            h_list: List[torch.Tensor] = []
+
+            for mc in range(cfg.eval_n_mc):
+                channel_mc = EVAL_CHANNEL_OFFSET + (bi * n_speeds + si) * 1_000_000 + mc
+                h_tf = sample_tdl_ofdm_channel(
+                    model=model_name,
+                    n_ofdm_symbols=cfg.n_symbols,
+                    n_subcarriers=cfg.n_freq_subcarriers,
+                    grid=grid,
+                    device=device,
+                    n_antennas=1,
+                    speed=speed,
+                    symbol_sampling_frequency=grid.subcarrier_spacing,
+                    dtype=cfg.dtype,
+                    seed=cfg.seed + TDL_CHANNEL_OFFSET + channel_mc,
+                )
+                h_true = vec_from_h(h_tf)
+                h_list.append(h_true)
+                for policy in ("cnn", "fixed", "active"):
+                    curve = run_closed_loop_mse_curve(
+                        cfg,
+                        h_true=h_true,
+                        sigma=sigma,
+                        device=device,
+                        channel_mc=channel_mc,
+                        policy_mode=policy,
+                        cnn_model=model if policy == "cnn" else None,
+                    )
+                    curves[policy].append(curve)
+
+            mean_curves = {name: np.mean(np.asarray(rows, dtype=np.float64), axis=0) for name, rows in curves.items()}
+
+            run_cfg = cfg.to_run_config()
+            full_mse_values: List[float] = []
+            for mc, h_true in enumerate(h_list):
+                gen_noise = torch.Generator(device=device).manual_seed(
+                    cfg.seed + EVAL_FULL_LMMSE_NOISE_OFFSET + mc
+                )
+                full_mse_values.append(
+                    full_subcarrier_batch_true_mse(h_true, sigma, run_cfg, device=device, generator=gen_noise)
+                )
+            full_mse = float(np.mean(full_mse_values))
+
+            ax = axes[bi][si]
+            for name, curve in mean_curves.items():
+                ax.semilogy(pilots, curve, linewidth=1.4, label=name)
+            ax.axhline(full_mse, color="red", linestyle=":", linewidth=1.0, label="full LMMSE")
+            ax.set_title(f"TDL-{model_name}, speed={speed:g} m/s")
+            ax.set_xlabel("n_pilots")
+            ax.set_ylabel("Mean average MSE")
+            ax.grid(True, which="both", linestyle="--", alpha=0.5)
+            if bi == 0 and si == 0:
+                ax.legend(fontsize=8)
+
+            payload["buckets"][f"{model_name}_{speed:g}"] = {
+                "curves": {k: v.tolist() for k, v in mean_curves.items()},
+                "full_lmmse_mse": full_mse,
+            }
+            print(
+                f"  TDL-{model_name} speed={speed:g}: "
+                + ", ".join(f"{k}={v[-1]:.4e}" for k, v in mean_curves.items())
+                + f", full_lmmse={full_mse:.4e}"
+            )
+
+    fig.suptitle(f"Phase 1b (time-freq): average MSE vs pilots, n_mc={cfg.eval_n_mc}/bucket")
+    fig.tight_layout()
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig_path = FIGURES_DIR / f"phase1b_average_mse_vs_pilots{suffix}.png"
+    json_path = FIGURES_DIR / f"phase1b_average_mse_vs_pilots{suffix}.json"
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved {fig_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1067,15 +1428,15 @@ def build_sanity_minibatch(
     cfg: CnnTrainConfig,
     *,
     batch_size: int,
-    sigma: torch.Tensor,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    grid = SionnaOFDMGrid(fft_size=cfg.n_subcarriers)
+    grid = make_grid(cfg)
     rows: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for ch in range(batch_size):
         h_true = sample_tdl_channel(cfg, channel_mc=ch, device=device, grid=grid)
         snap = collect_snapshots_one_channel(
-            cfg, h_true=h_true, sigma=sigma, channel_mc=ch, channel_idx=ch, device=device
+            cfg, h_true=h_true, sigma_by_bucket=sigma_by_bucket, channel_mc=ch, channel_idx=ch, device=device
         )
         rows.append(snap[0])
     return stack_snapshots(rows)
@@ -1090,19 +1451,22 @@ def sanity_check(
 ) -> None:
     """Overfit one minibatch; loss must decrease with finite gradients."""
     cfg = cfg or CnnTrainConfig()
+    _check_domain_config(cfg)
     device = resolve_device(cfg.device)
-    sanity_cfg = replace(cfg, n_cov_mc=min(cfg.n_cov_mc, 64))
+    sanity_cfg = replace(
+        cfg, n_cov_mc=min(cfg.n_cov_mc, 64), n_cov_mc_per_bucket=min(cfg.n_cov_mc_per_bucket, 64)
+    )
 
-    print(f"sanity: device={device}, batch_size={batch_size}, epochs={n_epochs}")
-    sigma = load_empirical_sigma(sanity_cfg, device, n_cov_mc=sanity_cfg.n_cov_mc)
+    print(f"sanity: device={device}, domain={cfg.domain}, batch_size={batch_size}, epochs={n_epochs}")
+    sigma_by_bucket = load_sigma_buckets(sanity_cfg, device)
 
-    print("Building one minibatch from TDL-A rollouts...")
-    x, y, _loss_mask = build_sanity_minibatch(cfg, batch_size=batch_size, sigma=sigma, device=device)
+    print(f"Building one minibatch from {cfg.domain} rollouts...")
+    x, y, _loss_mask = build_sanity_minibatch(cfg, batch_size=batch_size, sigma_by_bucket=sigma_by_bucket, device=device)
     x = x.to(device)
     y = y.to(device)
-    unused_mask = unused_mask_from_features(x)
+    unused_mask = unused_mask_from_features(x, domain=cfg.domain)
 
-    model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers).to(device)
+    model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers, **model_arch_kwargs(cfg)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
     print(f"Training on one minibatch ({NUM_FEATURE_CHANNELS} feature channels, unused-SC loss):")
@@ -1174,6 +1538,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--huber-delta", type=float, default=None)
     parser.add_argument("--eval-n-mc", type=int, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=None)
+    parser.add_argument(
+        "--domain",
+        choices=("antenna_snapshot", "time_freq"),
+        default=None,
+        help="antenna_snapshot (default) = today's static Na x Nc TDL-A snapshot; "
+        "time_freq = single-antenna joint (OFDM symbol x subcarrier) grid swept over "
+        "--tdl-models x --speeds buckets.",
+    )
+    parser.add_argument("--tdl-models", nargs="+", default=None, help="time_freq only, e.g. --tdl-models A B C")
+    parser.add_argument("--speeds", nargs="+", type=float, default=None, help="time_freq only, e.g. --speeds 3 30 120")
+    parser.add_argument("--n-cov-mc-per-bucket", type=int, default=None, help="time_freq only (default 256).")
+    parser.add_argument("--n-freq-subcarriers", type=int, default=None, help="time_freq only (default 32).")
+    parser.add_argument("--n-symbols", type=int, default=None, help="time_freq only (default 16).")
     return parser.parse_args()
 
 
@@ -1206,6 +1583,26 @@ def main() -> None:
         cfg.eval_n_mc = args.eval_n_mc
     if args.early_stop_patience is not None:
         cfg.early_stop_patience = args.early_stop_patience
+    if args.tdl_models is not None:
+        cfg.tdl_models = tuple(args.tdl_models)
+    if args.speeds is not None:
+        cfg.speeds = tuple(args.speeds)
+    if args.n_cov_mc_per_bucket is not None:
+        cfg.n_cov_mc_per_bucket = args.n_cov_mc_per_bucket
+    if args.n_freq_subcarriers is not None:
+        cfg.n_freq_subcarriers = args.n_freq_subcarriers
+    if args.n_symbols is not None:
+        cfg.n_symbols = args.n_symbols
+    if args.domain is not None:
+        cfg.domain = args.domain
+    if cfg.domain == "time_freq":
+        cfg.n_antennas = 1
+        cfg.n_subcarriers = cfg.n_symbols * cfg.n_freq_subcarriers
+        if args.label_mode is None:
+            # current mode didn't clearly beat fixed/active in the antenna domain; no reason
+            # to carry that weaker default into a new, pricier run unless explicitly requested.
+            cfg.label_mode = "counterfactual"
+    _check_domain_config(cfg)
 
     if args.phase == "sanity":
         sanity_check(cfg)
@@ -1220,10 +1617,10 @@ def main() -> None:
         if not args.force_regen and train_pt.exists() and val_pt.exists():
             print(f"cache hit: {train_pt}, {val_pt} (use --force-regen to rebuild)")
             return
-        sigma = load_empirical_sigma(cfg, device)
+        sigma_by_bucket = load_sigma_buckets(cfg, device)
         n_override = args.n_channels
-        build_dataset_cache(cfg, split="train", device=device, sigma=sigma, n_channels=n_override)
-        build_dataset_cache(cfg, split="val", device=device, sigma=sigma, n_channels=n_override)
+        build_dataset_cache(cfg, split="train", device=device, sigma_by_bucket=sigma_by_bucket, n_channels=n_override)
+        build_dataset_cache(cfg, split="val", device=device, sigma_by_bucket=sigma_by_bucket, n_channels=n_override)
         return
 
     if args.phase == "train":
@@ -1237,7 +1634,10 @@ def main() -> None:
         return
 
     if args.phase == "eval":
-        eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
+        if cfg.domain == "time_freq":
+            eval_phase1b_time_freq(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
+        else:
+            eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
         return
 
     if args.phase == "build-finetune":
