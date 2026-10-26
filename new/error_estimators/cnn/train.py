@@ -1301,6 +1301,9 @@ class CnnPilotPolicy:
         return int(scores.argmax().item())
 
 
+EVAL_RL_NOISE_OFFSET = 50_000  # disjoint from NOISE_OFFSET/EVAL_CNN_NOISE_OFFSET above
+
+
 def run_closed_loop_mse_curve(
     cfg: CnnTrainConfig,
     *,
@@ -1308,8 +1311,9 @@ def run_closed_loop_mse_curve(
     sigma: torch.Tensor,
     device: torch.device,
     channel_mc: int,
-    policy_mode: Literal["cnn", "fixed", "active"],
+    policy_mode: Literal["cnn", "fixed", "active", "rl"],
     cnn_model: Optional[CNNErrorEstimator] = None,
+    rl_model: Optional[CNNErrorEstimator] = None,
 ) -> List[float]:
     """Return average MSE after each pilot count (length max_pilots) via run_until_threshold.
     sigma is the single Sigma to use for this channel -- the caller resolves which bucket's
@@ -1326,6 +1330,13 @@ def run_closed_loop_mse_curve(
         noise_seed = cfg.seed + EVAL_CNN_NOISE_OFFSET + channel_mc
         select_mode = "argmin" if cfg.label_mode == "counterfactual" else "argmax"
         inner: PilotPolicy = CnnPilotPolicy(cnn_model, cfg=cfg, device=device, select_mode=select_mode)
+    elif policy_mode == "rl":
+        if rl_model is None:
+            raise ValueError("rl policy requires rl_model")
+        from error_estimators.rl.train import RlPilotPolicy  # local: avoids a module-load cycle
+
+        noise_seed = cfg.seed + EVAL_RL_NOISE_OFFSET + channel_mc
+        inner = RlPilotPolicy(rl_model, cfg=cfg, device=device)
     elif policy_mode == "fixed":
         noise_seed = cfg.seed + NOISE_OFFSET["fixed"] + channel_mc
         inner = _make_policy("fixed", cfg, device, seed=noise_seed, channel_mc=channel_mc)
@@ -1416,18 +1427,28 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
     print(f"  full LMMSE: {full_mse:.6e}")
 
 
-def eval_phase1b_time_freq(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
+def eval_phase1b_time_freq(
+    cfg: CnnTrainConfig, *, checkpoint_path: Path, rl_checkpoint_path: Optional[Path] = None
+) -> None:
     """Phase 1b eval for domain='time_freq': a 3x3 (tdl_models x speeds) grid of panels, each
     with its own cnn/fixed/active/full-LMMSE curves -- a single pooled curve (as in
     eval_phase1b) would hide whether the CNN generalizes evenly across buckets or just wins on
-    whichever it saw most."""
+    whichever it saw most. Passing rl_checkpoint_path adds a 4th 'rl' arm (see
+    error_estimators/rl/train.py::RlPilotPolicy) to every panel."""
     import matplotlib.pyplot as plt
     import numpy as np
 
     device = resolve_device(cfg.device)
     model = load_cnn_checkpoint(checkpoint_path, device)
+    rl_model = None
+    if rl_checkpoint_path is not None:
+        from error_estimators.rl.train import load_rl_checkpoint  # local: avoids a module-load cycle
+
+        rl_model = load_rl_checkpoint(rl_checkpoint_path, device)
     grid = make_grid(cfg)
     sigma_by_bucket = load_sigma_buckets(cfg, device)
+
+    policies: Tuple[str, ...] = ("cnn", "fixed", "active", "rl") if rl_model is not None else ("cnn", "fixed", "active")
 
     suffix = label_suffix(cfg)
     pilots = np.arange(1, cfg.max_pilots + 1)
@@ -1435,13 +1456,20 @@ def eval_phase1b_time_freq(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> Non
     fig, axes = plt.subplots(
         n_models, n_speeds, figsize=(5.0 * n_speeds, 4.0 * n_models), squeeze=False
     )
-    payload: Dict[str, Any] = {"n_mc": cfg.eval_n_mc, "checkpoint": str(checkpoint_path), "pilots": pilots.tolist(), "buckets": {}}
+    payload: Dict[str, Any] = {
+        "n_mc": cfg.eval_n_mc, "checkpoint": str(checkpoint_path),
+        "rl_checkpoint": str(rl_checkpoint_path) if rl_checkpoint_path is not None else None,
+        "pilots": pilots.tolist(), "buckets": {},
+    }
 
-    print(f"eval phase1b (time_freq): n_mc={cfg.eval_n_mc}/bucket, {n_models}x{n_speeds} buckets, checkpoint={checkpoint_path}")
+    print(
+        f"eval phase1b (time_freq): n_mc={cfg.eval_n_mc}/bucket, {n_models}x{n_speeds} buckets, "
+        f"checkpoint={checkpoint_path}, rl_checkpoint={rl_checkpoint_path}"
+    )
     for bi, model_name in enumerate(cfg.tdl_models):
         for si, speed in enumerate(cfg.speeds):
             sigma = sigma_by_bucket[(model_name, speed)]
-            curves: Dict[str, List[List[float]]] = {"cnn": [], "fixed": [], "active": []}
+            curves: Dict[str, List[List[float]]] = {name: [] for name in policies}
             h_list: List[torch.Tensor] = []
 
             for mc in range(cfg.eval_n_mc):
@@ -1460,7 +1488,7 @@ def eval_phase1b_time_freq(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> Non
                 )
                 h_true = vec_from_h(h_tf)
                 h_list.append(h_true)
-                for policy in ("cnn", "fixed", "active"):
+                for policy in policies:
                     curve = run_closed_loop_mse_curve(
                         cfg,
                         h_true=h_true,
@@ -1469,6 +1497,7 @@ def eval_phase1b_time_freq(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> Non
                         channel_mc=channel_mc,
                         policy_mode=policy,
                         cnn_model=model if policy == "cnn" else None,
+                        rl_model=rl_model if policy == "rl" else None,
                     )
                     curves[policy].append(curve)
 
@@ -1815,6 +1844,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="real_eval reduction across buckets: mean (default) or worst_bucket.",
     )
+    parser.add_argument(
+        "--rl-checkpoint", type=str, default=None,
+        help="--phase eval, --domain time_freq only: path to an error_estimators/rl/train.py "
+        "checkpoint (e.g. ppo_trajectory_tf_best.pt) to add a 4th 'rl' arm to the comparison.",
+    )
     return parser.parse_args()
 
 
@@ -1913,7 +1947,11 @@ def main() -> None:
 
     if args.phase == "eval":
         if cfg.domain == "time_freq":
-            eval_phase1b_time_freq(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
+            rl_checkpoint_path = Path(args.rl_checkpoint) if args.rl_checkpoint is not None else None
+            eval_phase1b_time_freq(
+                cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt",
+                rl_checkpoint_path=rl_checkpoint_path,
+            )
         else:
             eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
         return
