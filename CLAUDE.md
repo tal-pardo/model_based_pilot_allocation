@@ -13,7 +13,7 @@ Model-based pilot allocation for OFDM channel estimation (PyTorch, complex Gauss
 | `new/error_estimators/cnn/`: supervised CNN error estimator, `train.py` phases | `cnn-error-estimator` |
 | `old/`: legacy cumulative Gaussian code | `model-based-gaussian` |
 
-The skills are kept in both `.claude/skills/` and `.cursor/skills/` because the repo is also used with Cursor. **When you edit a skill, update both copies.** The CNN design plan is at `.cursor/plans/cnn_supervised_training_8ef4d544.plan.md`.
+Skills live in `.claude/skills/` only (Cursor is no longer used; `.cursor/skills/` was removed). The CNN design plan is at `.cursor/plans/cnn_supervised_training_8ef4d544.plan.md`.
 
 ## Environment
 

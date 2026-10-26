@@ -39,6 +39,7 @@ from train import (  # noqa: E402
     rollout_policy_name,
     sample_tdl_channel,
     stack_snapshots,
+    tdl_buckets,
 )
 from utils import resolve_device  # noqa: E402
 
@@ -139,6 +140,29 @@ def check_dimensions(
         f"(expected D={expected_d}, X=[D,6,{grid_na},{grid_nc}], y/mask=[D,{nc}])"
     )
     return CheckResult("dimensions", ok, detail)
+
+
+def check_bucket_idx(bucket_idx: torch.Tensor, meta: Dict[str, Any]) -> CheckResult:
+    """bucket_idx (D,) must match meta['bucket_assignment'] expanded per-row (time_freq), or be
+    all-zero (antenna_snapshot, single implicit bucket) -- validates the bucket-weighted-loss
+    plumbing's cache-time bookkeeping against the independently-recorded per-channel meta field."""
+    n_ch = int(meta["n_channels"])
+    snaps_per_ch = int(meta["max_pilots"]) - int(meta["k0"])
+    if meta.get("domain") != "time_freq":
+        ok = bool((bucket_idx == 0).all())
+        return CheckResult("bucket_idx", ok, f"antenna_snapshot: all-zero={ok}")
+
+    cfg = cfg_from_meta(meta)
+    buckets = tdl_buckets(cfg)
+    bucket_to_i = {b: i for i, b in enumerate(buckets)}
+    assignment = meta["bucket_assignment"]
+    expected = torch.tensor(
+        [bucket_to_i[tuple(assignment[ch])] for ch in range(n_ch) for _ in range(snaps_per_ch)],
+        dtype=torch.int64,
+    )
+    ok = bool(bucket_idx.shape == expected.shape and (bucket_idx == expected).all())
+    detail = f"shape={tuple(bucket_idx.shape)} matches meta['bucket_assignment']-derived expectation: {ok}"
+    return CheckResult("bucket_idx", ok, detail)
 
 
 def check_cached_channels_012(x: torch.Tensor, meta: Dict[str, Any]) -> List[CheckResult]:
@@ -369,13 +393,14 @@ def validate_split(
     skip_smoke_guard: bool = False,
 ) -> Tuple[List[CheckResult], bool]:
     print(f"\n=== {path.name} ===")
-    x, y, m, meta = load_dataset(path)
+    x, y, m, bucket_idx, meta = load_dataset(path)
     results: List[CheckResult] = []
 
     results.append(
         check_smoke_guard(meta, expected_n_channels=expected_n_channels, skip=skip_smoke_guard)
     )
     results.append(check_dimensions(x, y, m, meta))
+    results.append(check_bucket_idx(bucket_idx, meta))
     results.extend(check_cached_channels_012(x, meta))
     results.extend(check_cached_channels_345(x, meta))
     results.extend(check_cheap_sanity(y, m, meta))
@@ -452,7 +477,7 @@ def main() -> None:
     device = resolve_device(args.device)
     print(f"Device: {device}")
 
-    _, _, _, meta0 = load_dataset(train_path)
+    _, _, _, _, meta0 = load_dataset(train_path)
     cfg = cfg_from_meta(meta0)
     print(f"Loading empirical Sigma bucket(s) for rollout replay (domain={cfg.domain})...")
     sigma_by_bucket = load_sigma_buckets(cfg, device)

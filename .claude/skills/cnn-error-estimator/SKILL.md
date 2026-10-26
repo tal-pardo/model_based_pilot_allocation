@@ -61,11 +61,42 @@ Phase 1b / training rollouts (both modes): **no threshold stop** — run to `max
 | `h_hat_to_H`/`feature_grid_shape` reshape | `na=n_antennas, nc=n_subcarriers` (grid IS the flat candidate space) | `na=n_symbols, nc=n_freq_subcarriers` — **distinct** from the flat candidate space (`n_antennas=1, n_subcarriers=n_symbols*n_freq_subcarriers`) used by labels/LMMSE/policies; `build_features`'s `n_candidates` param decouples the two so the pilot-fraction feature uses the true flat count, not the grid width |
 | Artifact suffix | `label_suffix` → `""`/`"_cf"` | `label_suffix` → `"_tf"`/`"_tf_cf"` |
 | Phase 1b eval | `eval_phase1b`: one pooled cnn/fixed/active/full-LMMSE curve | `eval_phase1b_time_freq`: a `len(tdl_models) x len(speeds)` grid of panels, one curve set per bucket (a pooled curve would hide whether the CNN generalizes evenly across buckets) |
-| CLI | (no `--domain` flag needed) | `--domain time_freq --tdl-models A B C --speeds 3 30 120 --n-cov-mc-per-bucket 256 --n-freq-subcarriers 32 --n-symbols 16`; `--label-mode` auto-defaults to `counterfactual` unless passed explicitly (current mode didn't clearly beat fixed/active, no reason to carry that default into a pricier new-domain run) |
+| CLI | (no `--domain` flag needed) | `--domain time_freq --tdl-models A B C --speeds 3 30 120 --n-cov-mc-per-bucket 256 --n-freq-subcarriers 32 --n-symbols 16`; `--label-mode` auto-defaults to `counterfactual` unless passed explicitly (current mode didn't clearly beat fixed/active, no reason to carry that default into a pricier new-domain run). **Production config also needs `--kernel-hw 7 3 --select-checkpoint-by real_eval --real-eval-n-mc 30`** — see "Time-freq cluster-scale tuning" below. |
 
 Everything else (label functions at `na=1` block size, LMMSE primitives, `ActivePolicy`/`RandomPolicy`, `CnnPilotPolicy`'s argmax/argmin selection) is reused **unchanged** across both domains — only the pieces in the table above branch on `cfg.domain`. Phase 2 (`build-finetune`/`finetune`) stays `antenna_snapshot`-only, untouched by this mode.
 
 `--train-channels`/`--val-channels`/`--early-stop-patience` are **not** domain-conditioned in code (still the antenna-domain's shared defaults, 12,000/2,000/`None`) — pass them explicitly for a time-freq run, e.g. `--train-channels 13500 --val-channels 2250 --early-stop-patience 8` (~1,500/250 channels per bucket).
+
+## Time-freq cluster-scale tuning (this session)
+
+Cluster-scale build/train/eval (13,500/2,250 channels) done. Confirms the motivating question: `active` beats `fixed` by 2.7x-127x (vs. near-overlap in antenna domain), gap scales with speed (~3x@3m/s, ~20x@30m/s, ~100-130x@120m/s); TDL model A/B/C is secondary.
+
+**New `CnnTrainConfig` knobs** (all default to prior behavior; antenna_snapshot unaffected):
+
+| Field | Default | Tested, result |
+|---|---|---|
+| `kernel_hw` | `None` (domain default) | `(7,3)`: widen time-axis kernel only, RF 7→15 symbols. **Adopted as current best** — beats baseline 36/36 points checked, beats `use_global_context` 32/36. |
+| `use_global_context` | `False` | FiLM/squeeze-excite global-context branch. Worked (31/36 better) but superseded by `kernel_hw`. |
+| `bucket_weighted_loss` | `False` | Per-bucket Huber averaging instead of flat mean. **Failed** — worse 36/36 (noisier gradients, ~14 samples/bucket/batch). |
+| `loss_type` | `"huber"` | `"ranking_ce"`: cross-entropy vs. single true-best candidate. **Failed** — 8-32x worse than `kernel_hw` alone; `val_top1` never left chance. |
+| `select_checkpoint_by` | `"val_huber"` | `"real_eval"`: select on real closed-loop MSE, not val Huber. **Now recommended** — see fix below. |
+
+**Checkpoint-selection fix:** pooled val Huber correlates only ~0.36-0.41 (Pearson/Spearman) with real per-epoch MSE; epochs with near-identical val Huber differed up to 4x in real MSE. Use `select_checkpoint_by=real_eval`. Also fixed `val_top1_unused`: always checked `argmax`, wrong for `counterfactual` mode's `argmin` deployment — now follows `label_mode`.
+
+**Order tested** (each checked against full `n_mc=100` eval vs. then-current best):
+1. HP sweep (lr∈{1e-4,3e-4,1e-3,3e-3} × wd∈{1e-4,1e-3,1e-2}, picked by val Huber) — winner didn't hold up on real eval (worse 6/9 buckets). Motivated the selection fix above.
+2. `bucket_weighted_loss` — failed.
+3. `use_global_context` — worked, superseded.
+4. `kernel_hw=(7,3)` — **adopted**.
+5. `loss_type=ranking_ce` on top of #4 — failed.
+
+**Production config:** `domain=time_freq`, `label_mode=counterfactual`, `kernel_hw=(7,3)`, `loss_type=huber`, `select_checkpoint_by=real_eval`, `real_eval_n_mc=30`. Non-adopted variants kept locally (gitignored) under suffixes `_baseline_lr1e-3_wd1e-4`, `_lr3e-4_wd1e-3`, `_bucketloss`, `_globalctx`, `_globalctx_realeval`, `_kernel73`, `_rankce_kernel73`.
+
+```bash
+python new/error_estimators/cnn/train.py --phase train --domain time_freq --kernel-hw 7 3 \
+    --select-checkpoint-by real_eval --real-eval-n-mc 30 --early-stop-patience 8
+python new/error_estimators/cnn/train.py --phase eval --domain time_freq --kernel-hw 7 3 --eval-n-mc 100
+```
 
 ## Entry points
 
@@ -83,9 +114,9 @@ Everything else (label functions at `na=1` block size, LMMSE primitives, `Active
 
 **Features** `(6, Na, Nc)` float32: z-scored Re/Im/|Ĥ| across SCs; pilot mask; `log10(1/σ²)`; `n_pilots/Nc`. No `P`, no innovations. Same for both label modes.
 
-**Model** `CNNErrorEstimator`: `(B,6,16,32)` → 3× Conv2d(+GN+GELU) → mean over `Na` → Conv1d head → `(B, Nc)` (~33k params). Same for both label modes.
+**Model** `CNNErrorEstimator`: `(B,6,16,32)` → 3× Conv2d(+GN+GELU) → mean over `Na` → Conv1d head → `(B, Nc)` (~33k params). Same for both label modes. time_freq: `kernel_hw`/`use_global_context` overrides exist — see "Time-freq cluster-scale tuning" below.
 
-**Loss:** masked Huber on `log(e_k+ε)` (whichever `e_k` the label mode defines). Mask = **unused SCs only** (`unused_mask_from_features` from feature ch3); per-sample mean then batch mean. Checkpoint = lowest **val Huber** (unused-only). `cfg.early_stop_patience` (optional, `None` by default = no early stop) added for the reduced-scale counterfactual run; current-mode default stays fixed `max_epochs=40`, no patience.
+**Loss:** masked Huber on `log(e_k+ε)` (whichever `e_k` the label mode defines). Mask = **unused SCs only** (`unused_mask_from_features` from feature ch3); per-sample mean then batch mean. Checkpoint = lowest **val Huber** (unused-only) by default — time_freq should use `select_checkpoint_by=real_eval` instead, see below. `cfg.early_stop_patience` (optional, `None` by default = no early stop) added for the reduced-scale counterfactual run; current-mode default stays fixed `max_epochs=40`, no patience. `loss_type="ranking_ce"` alternative exists but failed for time_freq — see below.
 
 **Data (Phase 1, current mode):** TDL-A truth; empirical Σ̂ (`estimate_empirical_sigma_tdl_a`, `n_cov_mc=512`); 12k train / 2k val; policy mix `ch % 3` → random/fixed/active; `k0=1` + random first SC; 31 snapshots/channel.
 
@@ -145,7 +176,7 @@ After smoke build, always `--force-regen` before production train (same cache pa
 
 ## Artifacts (gitignored)
 
-Under `new/error_estimators/cnn/`: `data/`, `checkpoints/`, `figures/`. Not committed. Current-mode (`antenna_snapshot`) artifacts live on the cluster only; counterfactual-mode artifacts from the original local session were produced on `gaussian_san_check`/MX330. `domain="time_freq"` was implemented and smoke-tested end-to-end (sanity/build/train/eval, both label modes) locally on MX330/`gaussian_san_check` — no cluster-scale run yet.
+Under `new/error_estimators/cnn/`: `data/`, `checkpoints/`, `figures/`. Not committed. Current-mode (`antenna_snapshot`) artifacts live on the cluster only; counterfactual-mode artifacts from the original local session were produced on `gaussian_san_check`/MX330. `domain="time_freq"` is now run at cluster scale (13,500/2,250 channels) — see "Time-freq cluster-scale tuning" above for the current production config and what was tried.
 
 ## Seeds (subset)
 
@@ -197,6 +228,6 @@ Update this section when phases complete or design changes land.
 | Phase 3 HP sweep | **Deferred** | |
 | `domain="time_freq"` plumbing (config, Sigma buckets, DMRS-comb rollout branch, per-cell CNN head, `build_features` grid/zscore/n_candidates split) | **Done** | See Domains table above; design plan at `.cursor/plans/cnn_time_freq_domain_redesign.plan.md` |
 | `domain="time_freq"` local smoke validation | **Done** (MX330, `gaussian_san_check`) | `sanity`, tiny `build`→`train`→`eval` round trip, and `smoke_validation.py --suffix _tf_cf` all pass both domains; caught and fixed a real bug in `build_features`'s pilot-fraction denominator (was using grid width 32 instead of the flat 512-candidate count) during this testing |
-| `domain="time_freq"` cluster-scale `build`/`train`/`eval` | **Not started** | Not yet run at the agreed scale (`--train-channels 13500 --val-channels 2250`, `--early-stop-patience 8`); pass `--domain time_freq` explicitly, these two flags are not domain-conditioned in code |
+| `domain="time_freq"` cluster-scale `build`/`train`/`eval` | **Done** (cluster) | 13,500/2,250 channels; `active` beats `fixed` by 2.7x-127x, confirming the motivating question. See "Time-freq cluster-scale tuning" below for the HP/loss/architecture sweep and current production config (`kernel_hw=(7,3)`, `select_checkpoint_by=real_eval`). |
 
-**Resume:** `domain="time_freq"` is implemented and locally smoke-tested (not yet run at cluster scale) — see the Domains table above for the antenna_snapshot vs. time_freq diff, and the CLI section for the exact commands. The counterfactual-mode antenna-domain CNN allocator from an earlier session is trained and evaluated; `new/pilot_policy/cnn.py` + `new/experiments/exp11_cnn_allocator.py` are the reusable entry points (antenna-domain only — no time-freq consumer policy/experiment yet, by design, until Phase 1/1b results are in). Follow-ups if picked back up: run the time-freq Phase 1/1b at cluster scale and check whether `active` now shows a clearer edge over `fixed` (the original motivating question), or extend counterfactual mode with Phase 2 on-policy fine-tuning / a cluster-scale (12k/2k) rebuild for tighter MC noise in the antenna domain.
+**Resume:** `domain="time_freq"` is run at cluster scale; current best config is `kernel_hw=(7,3)` + `select_checkpoint_by=real_eval` (see "Time-freq cluster-scale tuning" above for what was tried and why). No time-freq consumer policy/experiment (`exp11`-equivalent) exists yet, by design. Open follow-ups: a listwise ranking loss (e.g. ListMLE) as a softer alternative to the failed `ranking_ce`; further `kernel_hw` tuning (wider/asymmetric); Phase 2 on-policy fine-tuning for time_freq (currently antenna-domain-only scaffold); a cluster-scale (12k/2k) antenna-domain rebuild for tighter MC noise.

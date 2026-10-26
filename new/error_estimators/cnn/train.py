@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
@@ -119,6 +120,39 @@ class CnnTrainConfig:
     n_cov_mc_per_bucket: int = 256
     dmrs_comb_spacing: int = 2
     dmrs_pilot_symbols: Tuple[int, ...] = (2, 6, 10, 14)
+    # time_freq only (no-op under "antenna_snapshot", where every sample already shares the one
+    # implicit bucket): average the masked Huber loss per (model,speed) bucket first, then mean
+    # those 9 bucket-means, instead of one flat per-sample mean across the whole batch. A flat
+    # mean lets whichever bucket has the largest native error scale (highest speed) dominate the
+    # gradient; bucket-weighting gives every bucket equal say regardless of its loss magnitude.
+    bucket_weighted_loss: bool = False
+    # time_freq only (no-op under "antenna_snapshot" by default): add a squeeze-excite/FiLM
+    # global-context branch to CNNErrorEstimator (see its docstring) so per-cell predictions can
+    # be conditioned on the sample's overall regime, which a ~7x7 local receptive field can't see.
+    use_global_context: bool = False
+    # Checkpoint-selection criterion. "val_huber" (default, preserves prior behavior exactly):
+    # select/early-stop on the masked-Huber regression loss over the validation set. "real_eval":
+    # select on an actual cnn-policy closed-loop MSE proxy (real_eval_cnn_score) instead -- a
+    # diagnostic across one 15-epoch time_freq run found pooled val Huber only weakly correlated
+    # with real deployment MSE (Pearson ~0.36-0.41 across epochs; epochs with near-identical val
+    # Huber differed by up to 4x in real MSE), so val Huber alone is not a reliable proxy for
+    # picking the best checkpoint in this multi-bucket setting.
+    select_checkpoint_by: Literal["val_huber", "real_eval"] = "val_huber"
+    real_eval_n_mc: int = 30  # held-out channels per bucket for the real_eval proxy (cheaper than eval_n_mc)
+    real_eval_criterion: Literal["mean", "worst_bucket"] = "mean"
+    # Override CNNErrorEstimator's per-domain default kernel_hw (None = use model_arch_kwargs's
+    # domain default, (3,3) for time_freq / (3,5) for antenna_snapshot). time_freq motivation:
+    # Doppler-driven decorrelation lives on the symbol (H) axis, so widening only H (e.g. (7,3))
+    # grows the time-axis receptive field (7->15 symbols on the 16-symbol grid, over 2 layers)
+    # without touching the frequency-axis kernel.
+    kernel_hw: Optional[Tuple[int, int]] = None
+    # "huber" (default, preserves prior behavior exactly): masked Huber regression on log(e+eps)
+    # per candidate. "ranking_ce": cross-entropy over unused candidates against the single true
+    # best one (CnnPilotPolicy's actual argmin/argmax deployment decision) instead of regressing
+    # the absolute label value -- see masked_ranking_ce_loss docstring for the motivation (label
+    # scale varies ~15x across time_freq's 9 buckets, which the deployment decision never needs
+    # to resolve, only the within-sample ranking).
+    loss_type: Literal["huber", "ranking_ce"] = "huber"
 
     @property
     def n_total(self) -> int:
@@ -361,10 +395,12 @@ class CNNErrorEstimator(nn.Module):
         n_subcarriers: int = 32,
         pool_mode: Literal["mean", "per_cell"] = "mean",
         kernel_hw: Tuple[int, int] = (3, 5),
+        use_global_context: bool = False,
     ) -> None:
         super().__init__()
         self.n_subcarriers = n_subcarriers
         self.pool_mode = pool_mode
+        self.use_global_context = use_global_context
         kh, kw = kernel_hw
         ph, pw = kh // 2, kw // 2
         self.conv2d = nn.Sequential(
@@ -378,6 +414,20 @@ class CNNErrorEstimator(nn.Module):
             nn.GroupNorm(8, 32),
             nn.GELU(),
         )
+        if use_global_context:
+            # Squeeze-excite / FiLM: global-average-pool the whole (H,W) grid into a per-sample
+            # context vector and use it to scale+shift the per-cell features before the head.
+            # Lets a cell's prediction be conditioned on the sample's overall regime (e.g. TDL
+            # model/speed) inferred from the full grid -- something a 7x7-ish local receptive
+            # field cannot see on its own. Last layer zero-init so training starts as identity
+            # (gamma=0 -> scale=1, beta=0) and only learns modulation if it helps.
+            self.context_mlp = nn.Sequential(
+                nn.Linear(32, 16),
+                nn.GELU(),
+                nn.Linear(16, 64),
+            )
+            nn.init.zeros_(self.context_mlp[-1].weight)
+            nn.init.zeros_(self.context_mlp[-1].bias)
         if pool_mode == "mean":
             self.head = nn.Sequential(
                 nn.Conv1d(32, 16, kernel_size=1),
@@ -396,6 +446,10 @@ class CNNErrorEstimator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Input: (B, 6, H, W). Output: (B, Nc)."""
         h = self.conv2d(x)
+        if self.use_global_context:
+            ctx = h.mean(dim=(2, 3))  # (B,32) global average pool over the whole grid
+            gamma, beta = self.context_mlp(ctx).chunk(2, dim=1)  # (B,32) each
+            h = h * (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) + beta.unsqueeze(-1).unsqueeze(-1)
         if self.pool_mode == "mean":
             h = h.mean(dim=2)
             h = self.head(h)
@@ -407,8 +461,16 @@ class CNNErrorEstimator(nn.Module):
 def model_arch_kwargs(cfg: "CnnTrainConfig") -> Dict[str, Any]:
     """Output: CNNErrorEstimator kwargs appropriate for cfg.domain (see class docstring)."""
     if cfg.domain == "time_freq":
-        return {"pool_mode": "per_cell", "kernel_hw": (3, 3)}
-    return {"pool_mode": "mean", "kernel_hw": (3, 5)}
+        return {
+            "pool_mode": "per_cell",
+            "kernel_hw": cfg.kernel_hw if cfg.kernel_hw is not None else (3, 3),
+            "use_global_context": cfg.use_global_context,
+        }
+    return {
+        "pool_mode": "mean",
+        "kernel_hw": cfg.kernel_hw if cfg.kernel_hw is not None else (3, 5),
+        "use_global_context": cfg.use_global_context,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -419,10 +481,15 @@ def masked_huber_loss(
     target: torch.Tensor,
     mask: torch.Tensor,
     delta: float = 1.0,
+    bucket_idx: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Input: pred, target, mask (B,Nc) 1 on SCs in loss. Output: scalar batch loss.
 
-    Mean Huber per sample over masked SCs, then mean over batch.
+    Mean Huber per sample over masked SCs, then mean over batch -- unless `bucket_idx` (B,) is
+    given and spans more than one value, in which case the per-sample losses are first averaged
+    within each bucket present in the batch, then those bucket-means are averaged uniformly. This
+    keeps a high-error-scale bucket (e.g. high speed) from dominating the gradient just because
+    its per-sample Huber values are larger than a low-error-scale bucket's.
     """
     residual = pred - target
     abs_r = residual.abs()
@@ -431,7 +498,35 @@ def masked_huber_loss(
     huber = torch.where(abs_r <= delta, quadratic, linear)
     denom = mask.sum(dim=1).clamp(min=1.0)
     per_sample = (huber * mask).sum(dim=1) / denom
-    return per_sample.mean()
+
+    if bucket_idx is None:
+        return per_sample.mean()
+    buckets = torch.unique(bucket_idx)
+    if buckets.numel() <= 1:
+        return per_sample.mean()
+    bucket_means = torch.stack([per_sample[bucket_idx == b].mean() for b in buckets])
+    return bucket_means.mean()
+
+
+def masked_ranking_ce_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    select_mode: Literal["argmax", "argmin"] = "argmin",
+) -> torch.Tensor:
+    """Input: pred (B,Nc) raw scores, target (B,Nc) true label, mask (B,Nc) 1 on unused SCs.
+    Output: scalar batch loss. Cross-entropy over unused candidates against the single best one
+    (argmin target for select_mode="argmin"/counterfactual, argmax for "argmax"/current) --
+    directly optimizes the deployment decision (CnnPilotPolicy's argmin/argmax pick) instead of
+    matching absolute label magnitudes, which vary ~15x in scale across time_freq's 9 buckets and
+    needn't be matched for the ranking to be correct. Discards the graded "how much worse" signal
+    Huber keeps; see CnnTrainConfig.loss_type docstring."""
+    unused = mask >= 0.5
+    masked_pred = pred.masked_fill(~unused, float("-inf"))
+    fill = float("inf") if select_mode == "argmin" else float("-inf")
+    masked_target = target.masked_fill(~unused, fill)
+    best_idx = masked_target.argmin(dim=1) if select_mode == "argmin" else masked_target.argmax(dim=1)
+    return F.cross_entropy(masked_pred, best_idx)
 
 
 def unused_mask_from_features(
@@ -452,19 +547,27 @@ def val_top1_unused(
     pred: torch.Tensor,
     target: torch.Tensor,
     unused_mask: torch.Tensor,
+    select_mode: Literal["argmax", "argmin"] = "argmax",
 ) -> float:
-    """Fraction of samples where argmax pred on unused SCs matches argmax target."""
+    """Fraction of samples where pred's deployment pick on unused SCs (argmax for select_mode=
+    "argmax", i.e. label_mode="current"; argmin for "argmin", i.e. label_mode="counterfactual")
+    matches target's. Must match CnnPilotPolicy's select_mode for this number to mean anything --
+    checking argmax agreement for a counterfactual-mode (argmin-deployed) checkpoint silently
+    measures the wrong direction."""
     hits = 0
     total = 0
+    fill = float("-inf") if select_mode == "argmax" else float("inf")
     for b in range(pred.shape[0]):
         m = unused_mask[b] > 0.5
         if m.sum() < 1:
             continue
         p = pred[b].clone()
         t = target[b].clone()
-        p[~m] = float("-inf")
-        t[~m] = float("-inf")
-        if p.argmax().item() == t.argmax().item():
+        p[~m] = fill
+        t[~m] = fill
+        p_best = p.argmax().item() if select_mode == "argmax" else p.argmin().item()
+        t_best = t.argmax().item() if select_mode == "argmax" else t.argmin().item()
+        if p_best == t_best:
             hits += 1
         total += 1
     return hits / max(total, 1)
@@ -809,6 +912,8 @@ def build_dataset_cache(
 
     print(f"build {split}: {n_ch} channels, device={device}")
     all_rows: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    bucket_idx_rows: List[int] = []
+    n_buckets = len(tdl_buckets(cfg)) if cfg.domain == "time_freq" else 1
     t0 = time.perf_counter()
 
     for ch in range(n_ch):
@@ -818,11 +923,14 @@ def build_dataset_cache(
             cfg, h_true=h_true, sigma_by_bucket=sigma_by_bucket, channel_mc=mc, channel_idx=ch, device=device
         )
         all_rows.extend(rows)
+        ch_bucket_idx = (mc % n_buckets) if cfg.domain == "time_freq" else 0
+        bucket_idx_rows.extend([ch_bucket_idx] * len(rows))
         if (ch + 1) % GEN_LOG_INTERVAL == 0 or ch + 1 == n_ch:
             elapsed = time.perf_counter() - t0
             print(f"  {split} channel {ch + 1}/{n_ch}, {len(all_rows)} snapshots, {elapsed:.1f}s")
 
     x, y, m = stack_snapshots(all_rows)
+    bucket_idx = torch.tensor(bucket_idx_rows, dtype=torch.int64)
     meta: Dict[str, Any] = {
         **{k: (v if not isinstance(v, torch.dtype) else str(v)) for k, v in asdict(cfg).items()},
         "split": split,
@@ -835,7 +943,9 @@ def build_dataset_cache(
             list(bucket_for_channel(cfg, _channel_mc_for_split(split, ch, cfg))) for ch in range(n_ch)
         ]
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save({"X": x.cpu(), "y_label": y.cpu(), "loss_mask": m.cpu(), "meta": meta}, out)
+    torch.save(
+        {"X": x.cpu(), "y_label": y.cpu(), "loss_mask": m.cpu(), "bucket_idx": bucket_idx, "meta": meta}, out
+    )
     print(f"Saved {out}: X={tuple(x.shape)}, y_label={tuple(y.shape)}, loss_mask={tuple(m.shape)}")
     return out
 
@@ -843,9 +953,16 @@ def build_dataset_cache(
 # ---------------------------------------------------------------------------
 # 10. train_loop
 # ---------------------------------------------------------------------------
-def load_dataset(path: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+def load_dataset(
+    path: Path,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    return blob["X"], blob["y_label"], blob["loss_mask"], blob["meta"]
+    bucket_idx = blob.get("bucket_idx")
+    if bucket_idx is None:
+        # pre-bucket-weighted-loss cache (or antenna_snapshot, which has only one implicit
+        # bucket): every sample gets bucket 0, so bucket-weighted loss reduces to the flat mean.
+        bucket_idx = torch.zeros(blob["X"].shape[0], dtype=torch.int64)
+    return blob["X"], blob["y_label"], blob["loss_mask"], bucket_idx, blob["meta"]
 
 
 def run_epoch(
@@ -857,26 +974,34 @@ def run_epoch(
     huber_delta: float,
     train: bool,
     domain: Literal["antenna_snapshot", "time_freq"] = "antenna_snapshot",
+    bucket_weighted: bool = False,
+    label_mode: Literal["current", "counterfactual"] = "current",
+    loss_type: Literal["huber", "ranking_ce"] = "huber",
 ) -> Tuple[float, float]:
     if train:
         model.train()
     else:
         model.eval()
 
+    select_mode: Literal["argmax", "argmin"] = "argmin" if label_mode == "counterfactual" else "argmax"
     total_loss = 0.0
     total_top1 = 0.0
     n_batches = 0
 
-    for x_b, y_b, _m_b in loader:
+    for x_b, y_b, _m_b, b_b in loader:
         x_b = x_b.to(device)
         y_b = y_b.to(device)
         unused_mask = unused_mask_from_features(x_b, domain=domain)
+        bucket_idx = b_b.to(device) if bucket_weighted else None
 
         if train and optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
         pred = model(x_b)
-        loss = masked_huber_loss(pred, y_b, unused_mask, huber_delta)
+        if loss_type == "ranking_ce":
+            loss = masked_ranking_ce_loss(pred, y_b, unused_mask, select_mode=select_mode)
+        else:
+            loss = masked_huber_loss(pred, y_b, unused_mask, huber_delta, bucket_idx=bucket_idx)
 
         if train and optimizer is not None:
             loss.backward()
@@ -884,10 +1009,62 @@ def run_epoch(
 
         total_loss += loss.item()
         if not train:
-            total_top1 += val_top1_unused(pred.detach(), y_b, unused_mask)
+            total_top1 += val_top1_unused(pred.detach(), y_b, unused_mask, select_mode=select_mode)
         n_batches += 1
 
     return total_loss / max(n_batches, 1), total_top1 / max(n_batches, 1)
+
+
+def real_eval_cnn_score(
+    cfg: CnnTrainConfig,
+    model: "CNNErrorEstimator",
+    *,
+    sigma_by_bucket: Dict[Tuple[str, float], torch.Tensor],
+    grid: "SionnaOFDMGrid",
+    device: torch.device,
+    n_mc: int,
+) -> Dict[str, Any]:
+    """Cheap real-deployment proxy for checkpoint selection (see CnnTrainConfig.select_checkpoint_by):
+    cnn-policy closed-loop average MSE at max_pilots on n_mc held-out channels per bucket --
+    antenna_snapshot has one implicit bucket (sigma_by_bucket's single entry), time_freq has 9.
+    Uses the same held-out channel-id range as eval_phase1b(_time_freq) (EVAL_CHANNEL_OFFSET),
+    so these channels never overlap train/val."""
+    buckets = list(sigma_by_bucket.keys())
+    per_bucket_mse: Dict[str, float] = {}
+    for bi, (model_name, speed) in enumerate(buckets):
+        sigma = sigma_by_bucket[(model_name, speed)]
+        mses: List[float] = []
+        for mc in range(n_mc):
+            channel_mc = EVAL_CHANNEL_OFFSET + bi * 1_000_000 + mc
+            if cfg.domain == "time_freq":
+                # sample_tdl_channel's time_freq branch would pick its OWN bucket from
+                # bucket_for_channel(channel_mc % 9), ignoring model_name/speed here -- sample
+                # this bucket's channel directly (mirrors eval_phase1b_time_freq) so the channel
+                # actually matches the Sigma used above.
+                h_tf = sample_tdl_ofdm_channel(
+                    model=model_name, n_ofdm_symbols=cfg.n_symbols, n_subcarriers=cfg.n_freq_subcarriers,
+                    grid=grid, device=device, n_antennas=1, speed=speed,
+                    symbol_sampling_frequency=grid.subcarrier_spacing, dtype=cfg.dtype,
+                    seed=cfg.seed + TDL_CHANNEL_OFFSET + channel_mc,
+                )
+                h_true = vec_from_h(h_tf)
+            else:
+                h_true = sample_tdl_channel(cfg, channel_mc=channel_mc, device=device, grid=grid)
+            curve = run_closed_loop_mse_curve(
+                cfg, h_true=h_true, sigma=sigma, device=device, channel_mc=channel_mc,
+                policy_mode="cnn", cnn_model=model,
+            )
+            mses.append(curve[-1])
+        key = f"{model_name}_{speed:g}" if cfg.domain == "time_freq" else "antenna_snapshot"
+        per_bucket_mse[key] = float(sum(mses) / len(mses))
+    mean_mse = float(sum(per_bucket_mse.values()) / len(per_bucket_mse))
+    worst_bucket = max(per_bucket_mse, key=per_bucket_mse.get)
+    return {
+        "mean_mse": mean_mse,
+        "worst_bucket": worst_bucket,
+        "worst_mse": per_bucket_mse[worst_bucket],
+        "per_bucket_mse": per_bucket_mse,
+    }
 
 
 def train_loop(
@@ -899,46 +1076,77 @@ def train_loop(
     metrics_path: Path,
 ) -> None:
     device = resolve_device(cfg.device)
-    x_tr, y_tr, m_tr, _ = load_dataset(train_path)
-    x_va, y_va, m_va, _ = load_dataset(val_path)
+    x_tr, y_tr, m_tr, b_tr, _ = load_dataset(train_path)
+    x_va, y_va, m_va, b_va, _ = load_dataset(val_path)
 
     train_loader = DataLoader(
-        TensorDataset(x_tr, y_tr, m_tr), batch_size=cfg.batch_size, shuffle=True, num_workers=0
+        TensorDataset(x_tr, y_tr, m_tr, b_tr), batch_size=cfg.batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
-        TensorDataset(x_va, y_va, m_va), batch_size=cfg.batch_size, shuffle=False, num_workers=0
+        TensorDataset(x_va, y_va, m_va, b_va), batch_size=cfg.batch_size, shuffle=False, num_workers=0
     )
 
     arch_kwargs = model_arch_kwargs(cfg)
     model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers, **arch_kwargs).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    best_val = float("inf")
+    use_real_eval = cfg.select_checkpoint_by == "real_eval"
+    sigma_by_bucket: Optional[Dict[Tuple[str, float], torch.Tensor]] = None
+    grid = None
+    if use_real_eval:
+        grid = make_grid(cfg)
+        sigma_by_bucket = load_sigma_buckets(cfg, device)
+
+    best_select_metric = float("inf")
     best_epoch = -1
     best_top1 = 0.0
     epochs_no_improve = 0
     metrics: List[Dict[str, Any]] = []
 
+    if cfg.loss_type == "ranking_ce":
+        loss_desc = "ranking cross-entropy (argmin/argmax over unused SCs)"
+    elif cfg.bucket_weighted_loss:
+        loss_desc = "bucket-weighted Huber (per-bucket mean, then mean over buckets)"
+    else:
+        loss_desc = "unused-SC Huber (per-sample mean)"
+    select_desc = (
+        f"real_eval({cfg.real_eval_criterion}, n_mc={cfg.real_eval_n_mc})" if use_real_eval else "val_huber"
+    )
     print(
         f"train: device={device}, train={len(x_tr)} val={len(x_va)} "
         f"batch={cfg.batch_size}, max_epochs={cfg.max_epochs}, label_mode={cfg.label_mode}, "
-        f"domain={cfg.domain}, loss=unused-SC Huber (per-sample mean)"
+        f"domain={cfg.domain}, loss={loss_desc}, select_checkpoint_by={select_desc}"
     )
 
     for epoch in range(1, cfg.max_epochs + 1):
         t0 = time.perf_counter()
         train_huber, _ = run_epoch(
             model, train_loader, device=device, optimizer=opt, huber_delta=cfg.huber_delta,
-            train=True, domain=cfg.domain,
+            train=True, domain=cfg.domain, bucket_weighted=cfg.bucket_weighted_loss,
+            label_mode=cfg.label_mode, loss_type=cfg.loss_type,
         )
         val_huber, val_top1 = run_epoch(
             model, val_loader, device=device, optimizer=None, huber_delta=cfg.huber_delta,
-            train=False, domain=cfg.domain,
+            train=False, domain=cfg.domain, bucket_weighted=cfg.bucket_weighted_loss,
+            label_mode=cfg.label_mode, loss_type=cfg.loss_type,
         )
+
+        real_eval_result: Optional[Dict[str, Any]] = None
+        if use_real_eval:
+            real_eval_result = real_eval_cnn_score(
+                cfg, model, sigma_by_bucket=sigma_by_bucket, grid=grid, device=device, n_mc=cfg.real_eval_n_mc,
+            )
+            select_metric = (
+                real_eval_result["worst_mse"] if cfg.real_eval_criterion == "worst_bucket"
+                else real_eval_result["mean_mse"]
+            )
+        else:
+            select_metric = val_huber
+
         elapsed = time.perf_counter() - t0
         star = ""
-        if val_huber < best_val:
-            best_val = val_huber
+        if select_metric < best_select_metric:
+            best_select_metric = select_metric
             best_epoch = epoch
             best_top1 = val_top1
             epochs_no_improve = 0
@@ -949,13 +1157,15 @@ def train_loop(
                     "model_state_dict": model.state_dict(),
                     "cfg": asdict(cfg),
                     "best_epoch": best_epoch,
-                    "best_val_huber": best_val,
+                    "best_select_metric": best_select_metric,
+                    "best_val_huber": val_huber,
                     "best_val_top1": best_top1,
                     "arch": {
                         "class": "CNNErrorEstimator",
                         "n_subcarriers": cfg.n_subcarriers,
                         "pool_mode": arch_kwargs["pool_mode"],
                         "kernel_hw": list(arch_kwargs["kernel_hw"]),
+                        "use_global_context": arch_kwargs["use_global_context"],
                     },
                 },
                 checkpoint_path,
@@ -963,13 +1173,21 @@ def train_loop(
         else:
             epochs_no_improve += 1
 
-        metrics.append(
-            {"epoch": epoch, "train_huber": train_huber, "val_huber": val_huber, "val_top1": val_top1}
-        )
-        print(
+        record = {"epoch": epoch, "train_huber": train_huber, "val_huber": val_huber, "val_top1": val_top1}
+        log_line = (
             f"epoch {epoch:03d}/{cfg.max_epochs:03d}  train_huber={train_huber:.4f}  "
-            f"val_huber={val_huber:.4f}  val_top1={val_top1:.3f}  {elapsed:.1f}s{star}"
+            f"val_huber={val_huber:.4f}  val_top1={val_top1:.3f}"
         )
+        if real_eval_result is not None:
+            record["real_eval_mean_mse"] = real_eval_result["mean_mse"]
+            record["real_eval_worst_bucket"] = real_eval_result["worst_bucket"]
+            record["real_eval_worst_mse"] = real_eval_result["worst_mse"]
+            log_line += (
+                f"  real_eval_mean={real_eval_result['mean_mse']:.4e}  "
+                f"real_eval_worst={real_eval_result['worst_bucket']}({real_eval_result['worst_mse']:.4e})"
+            )
+        metrics.append(record)
+        print(f"{log_line}  {elapsed:.1f}s{star}")
 
         if cfg.early_stop_patience is not None and epochs_no_improve >= cfg.early_stop_patience:
             print(f"early stopping at epoch {epoch} (no val improvement for {cfg.early_stop_patience} epochs)")
@@ -978,8 +1196,9 @@ def train_loop(
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+    metric_str = f"{best_select_metric:.4e}" if use_real_eval else f"{best_select_metric:.4f}"
     print(
-        f"train done: best_val_huber={best_val:.4f} @ epoch {best_epoch}  "
+        f"train done: best_{select_desc}={metric_str} @ epoch {best_epoch}  "
         f"best_val_top1={best_top1:.3f}  checkpoint={checkpoint_path}"
     )
 
@@ -993,7 +1212,10 @@ def load_cnn_checkpoint(path: Path, device: torch.device) -> CNNErrorEstimator:
     nc = int(arch.get("n_subcarriers", 32))
     pool_mode = arch.get("pool_mode", "mean")
     kernel_hw = tuple(arch.get("kernel_hw", (3, 5)))
-    model = CNNErrorEstimator(n_subcarriers=nc, pool_mode=pool_mode, kernel_hw=kernel_hw).to(device)
+    use_global_context = arch.get("use_global_context", False)
+    model = CNNErrorEstimator(
+        n_subcarriers=nc, pool_mode=pool_mode, kernel_hw=kernel_hw, use_global_context=use_global_context
+    ).to(device)
     model.load_state_dict(blob["model_state_dict"])
     return model
 
@@ -1363,14 +1585,14 @@ def finetune_loop(cfg: CnnTrainConfig, *, init_checkpoint: Path) -> None:
     model = CNNErrorEstimator(n_subcarriers=cfg.n_subcarriers).to(device)
     model.load_state_dict(blob["model_state_dict"])
 
-    x_tr, y_tr, m_tr, _ = load_dataset(DATA_DIR / "phase2_train.pt")
-    x_va, y_va, m_va, _ = load_dataset(DATA_DIR / "phase2_val.pt")
+    x_tr, y_tr, m_tr, b_tr, _ = load_dataset(DATA_DIR / "phase2_train.pt")
+    x_va, y_va, m_va, b_va, _ = load_dataset(DATA_DIR / "phase2_val.pt")
 
     train_loader = DataLoader(
-        TensorDataset(x_tr, y_tr, m_tr), batch_size=cfg.batch_size, shuffle=True, num_workers=0
+        TensorDataset(x_tr, y_tr, m_tr, b_tr), batch_size=cfg.batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
-        TensorDataset(x_va, y_va, m_va), batch_size=cfg.batch_size, shuffle=False, num_workers=0
+        TensorDataset(x_va, y_va, m_va, b_va), batch_size=cfg.batch_size, shuffle=False, num_workers=0
     )
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -1551,6 +1773,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-cov-mc-per-bucket", type=int, default=None, help="time_freq only (default 256).")
     parser.add_argument("--n-freq-subcarriers", type=int, default=None, help="time_freq only (default 32).")
     parser.add_argument("--n-symbols", type=int, default=None, help="time_freq only (default 16).")
+    parser.add_argument(
+        "--bucket-weighted-loss",
+        action="store_true",
+        default=False,
+        help="time_freq only (no-op under antenna_snapshot): average masked Huber per "
+        "(model,speed) bucket, then mean those bucket-means, instead of one flat per-sample "
+        "mean -- keeps the highest-speed bucket's larger loss scale from dominating the gradient.",
+    )
+    parser.add_argument(
+        "--use-global-context",
+        action="store_true",
+        default=False,
+        help="Add a squeeze-excite/FiLM global-context branch to CNNErrorEstimator so per-cell "
+        "predictions can be conditioned on the sample's overall regime (see class docstring).",
+    )
+    parser.add_argument(
+        "--select-checkpoint-by",
+        choices=("val_huber", "real_eval"),
+        default=None,
+        help="Checkpoint-selection criterion (default val_huber). real_eval selects on an actual "
+        "cnn-policy closed-loop MSE proxy instead -- see CnnTrainConfig.select_checkpoint_by.",
+    )
+    parser.add_argument("--real-eval-n-mc", type=int, default=None, help="Held-out channels per bucket for --select-checkpoint-by=real_eval (default 30).")
+    parser.add_argument(
+        "--kernel-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
+        help="Override CNNErrorEstimator's per-domain default conv kernel (H,W), e.g. --kernel-hw 7 3 "
+        "to widen the time_freq symbol-axis receptive field.",
+    )
+    parser.add_argument(
+        "--loss-type",
+        choices=("huber", "ranking_ce"),
+        default=None,
+        help="Training loss (default huber). ranking_ce: cross-entropy over unused candidates "
+        "against the single true best one, directly optimizing the argmin/argmax deployment "
+        "decision instead of regressing the absolute label value -- see masked_ranking_ce_loss.",
+    )
+    parser.add_argument(
+        "--real-eval-criterion",
+        choices=("mean", "worst_bucket"),
+        default=None,
+        help="real_eval reduction across buckets: mean (default) or worst_bucket.",
+    )
     return parser.parse_args()
 
 
@@ -1583,6 +1847,20 @@ def main() -> None:
         cfg.eval_n_mc = args.eval_n_mc
     if args.early_stop_patience is not None:
         cfg.early_stop_patience = args.early_stop_patience
+    if args.bucket_weighted_loss:
+        cfg.bucket_weighted_loss = True
+    if args.use_global_context:
+        cfg.use_global_context = True
+    if args.select_checkpoint_by is not None:
+        cfg.select_checkpoint_by = args.select_checkpoint_by
+    if args.real_eval_n_mc is not None:
+        cfg.real_eval_n_mc = args.real_eval_n_mc
+    if args.real_eval_criterion is not None:
+        cfg.real_eval_criterion = args.real_eval_criterion
+    if args.kernel_hw is not None:
+        cfg.kernel_hw = tuple(args.kernel_hw)
+    if args.loss_type is not None:
+        cfg.loss_type = args.loss_type
     if args.tdl_models is not None:
         cfg.tdl_models = tuple(args.tdl_models)
     if args.speeds is not None:
