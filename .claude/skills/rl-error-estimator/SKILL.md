@@ -158,11 +158,20 @@ Update this section when phases complete or design changes land.
 | Stage A (REINFORCE + per-bucket baseline) | **Done**, untested at scale | Local tiny-config smoke test only (2 updates x 2 episodes, `n_cov_mc_per_bucket=4`) — runs end-to-end, no crash/NaN; real learning quality not yet checked |
 | Stage B (PPO + per-bucket-normalized advantage, warm-start from Stage A) | **Done**, untested at scale | Same tiny-config smoke test, including `--init-checkpoint` warm-start path |
 | `"rl"` arm in `run_closed_loop_mse_curve`/`eval_phase1b_time_freq`/`--rl-checkpoint` CLI | **Done** | Smoke-tested end-to-end locally (fixed/active/cnn/rl, 1 channel/bucket) against the local `phase1_tf_cf_best.pt` |
-| Cluster-scale training (both stages) + full 4-arm eval (`eval_n_mc=100`) | **Not started** | Pending a cluster run — see CLI above for the production-scale commands |
+| Cluster-scale training (both stages) + full 4-arm eval (`eval_n_mc=100`) | **Done** | 2026-10-26/27, cs-pheno-09 (RTX 3090). Checkpoint confirmed: `phase1_tf_cf_best.pt` cfg matched the CLI defaults exactly (`kernel_hw=(7,3)`, `tdl_models=(A,B,C)`, `speeds=(3,30,120)`, `n_freq_subcarriers=32`, `n_symbols=16`, `n_cov_mc_per_bucket=256`, `sigma2=0.01`, `max_pilots=32`) — no flag adjustments needed. 200-update REINFORCE sanity run: `real_eval_mean` 2.93e-1→1.12e-1, clearly improving, cleared to proceed. **`n_updates` was cut from the literal 3000/1500 defaults to 1200/800** — the measured ~9.3s/update at `episodes_per_update=72` meant the literal defaults (plus `real_eval_n_mc=30`) would have projected to ~9.75h for Stage A alone, blowing the 8h allocation. Stage A (REINFORCE, 1200 updates): best `real_eval_mean=9.09e-2 @ update 1000`; noisy plateau in the 0.09–0.13 band from update ~500 onward (entropy fell 6.1→~2–4 and oscillated, never fully collapsed); final (update 1200) was 1.06e-1. Stage B (PPO, 800 updates, warm-started from the Stage A checkpoint, ~6.3s/update): best `real_eval_mean=9.05e-2 @ update 25` — **essentially the warm-start point; PPO never improved on it across the full 800 updates**, oscillating 0.093–0.113 throughout with no clear trend (`value_loss` did converge cleanly 11.6k→~50-100, so the critic fit fine — the policy just didn't improve). Final 4-arm eval (`eval_n_mc=100`, final-pilot/pilot-32 mean MSE, figure+JSON at `cnn/figures/phase1b_average_mse_vs_pilots_tf_cf.{png,json}`): `active` wins 8/9 buckets; `rl` wins outright only on B_120 (2.6558e-3 vs active's 2.7646e-3); `rl` beats `cnn` in 7/9 buckets (loses only at the two 3 m/s buckets A_3, C_3, where `cnn`'s regression-based estimator does comparatively better); `rl` always clears `fixed` by a wide margin. Per-bucket (cnn / fixed / active / rl / full_lmmse): A_3 1.02e-3/3.01e-3/8.04e-4/1.38e-3/2.23e-4; A_30 2.51e-3/3.15e-2/1.43e-3/1.73e-3/9.59e-4; A_120 6.87e-3/3.44e-1/2.70e-3/2.97e-3/3.28e-3; B_3 1.01e-3/2.70e-3/8.51e-4/1.17e-3/2.26e-4; B_30 2.19e-3/2.63e-2/1.42e-3/1.48e-3/8.49e-4; B_120 6.48e-3/2.92e-1/2.76e-3/2.66e-3/3.21e-3; C_3 1.28e-3/3.47e-3/1.27e-3/2.60e-3/2.46e-4; C_30 2.87e-3/3.87e-2/1.59e-3/2.02e-3/8.90e-4; C_120 7.03e-3/2.93e-1/2.86e-3/3.07e-3/3.23e-3. |
 
-**Resume:** code is implemented and correctness-smoke-tested (tiny configs, both
-stages, both local and through the CNN's eval pipeline) but never run at real scale,
-and never checked for whether it actually learns a good policy (just that it doesn't
-crash). Next step is the cluster-scale run in the CLI section above, then updating
-this table with the real `real_eval_mean` trend and the final 4-arm comparison
-result.
+**Resume:** first cluster-scale run is complete end-to-end (both stages + 4-arm eval);
+code works correctly at scale and the RL policy is a legitimate second-best arm
+(beats `fixed` everywhere, beats `cnn` at 30/120 m/s, loses to `cnn` at 3 m/s, trails
+`active` almost everywhere by a modest margin). **The open question for a follow-up
+run is why Stage B (PPO) produced no improvement over the warm-started Stage A
+policy** — it held flat in the same 0.09–0.11 band across all 800 updates rather than
+refining it, despite the critic (`value_loss`) converging cleanly. Worth investigating
+before trusting PPO's design as-is: try a lower `--lr` (the default may be too high
+for a warm-started policy and immediately disrupting the good REINFORCE solution),
+a smaller `--clip-eps`, tuning `--entropy-coef`, or simply confirming via ablation
+whether PPO at all helps over just running REINFORCE longer. Also note `n_updates`
+for both stages was sized to the available compute window (1200/800, not the
+documented 3000/1500 CLI defaults above) — rerun with the full defaults if a longer
+allocation is available, since Stage A's plateau (0.09–0.13, not still clearly
+descending at update 1200) suggests more updates might still help.
