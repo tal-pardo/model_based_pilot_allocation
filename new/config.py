@@ -198,7 +198,9 @@ class Exp13Config(ExpRunConfig):
     # noisy early rebuild can't blow up the estimate (see exp13 plan risk #5).
     sbl_burn_in_pilots: int = 32
     sbl_update_every: int = 4
-    sbl_sigma_damping: float = 0.5
+    # 0.5 let an under-informed rebuild candidate dominate and corrupt the posterior for the
+    # rest of the run (NMSE 0.002->0.7 at the first rebuild); 0.99 keeps rebuilds stable.
+    sbl_sigma_damping: float = 0.99
     # alpha_min bounds the max prior variance (1/alpha_min) any single delay-Doppler coefficient
     # may claim; channel power is unit-normalized, so letting one noisy early estimate claim
     # variance orders of magnitude above that (the original 1e-6 -> up to 1e6) makes the
