@@ -332,9 +332,11 @@ def ppo_update(
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            chain(model.parameters(), value_model.parameters()), max_norm=grad_clip_norm
-        )
+        # Clipped separately: value_loss runs ~1e3-1e4x larger than policy_loss, so a joint
+        # clip_grad_norm_ over both networks lets the value net's gradient dominate the combined
+        # norm and the rescale crushes the policy's gradient to near-zero regardless of lr/value_coef.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+        torch.nn.utils.clip_grad_norm_(value_model.parameters(), max_norm=grad_clip_norm)
         optimizer.step()
         metrics = {
             "loss": float(loss.item()),
