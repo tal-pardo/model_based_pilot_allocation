@@ -226,6 +226,7 @@ def run_sbl_arm(
     alpha_init = 1.0 / torch.diagonal(transform @ sigma_hat_raw @ transform.mH).real.clamp(
         min=cfg.sbl_eps
     )
+    target_trace = sigma_init.diagonal().real.sum().clamp(min=cfg.sbl_eps)
     traces: List[RunTrace] = []
 
     for mc, h_true in enumerate(h_list):
@@ -291,6 +292,8 @@ def run_sbl_arm(
                 )
                 sigma_candidate = transform.mH @ torch.diag(1.0 / alpha).to(dtype) @ transform
                 sigma_candidate = 0.5 * (sigma_candidate + sigma_candidate.mH)
+                candidate_trace = sigma_candidate.diagonal().real.sum().clamp(min=cfg.sbl_eps)
+                sigma_candidate = sigma_candidate * (target_trace / candidate_trace)
                 sigma_current = damp_sigma_update(
                     sigma_current, sigma_candidate, damping=cfg.sbl_sigma_damping
                 )
