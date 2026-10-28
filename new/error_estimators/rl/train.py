@@ -86,7 +86,11 @@ class RlTrainConfig(CnnTrainConfig):
     ppo_epochs: int = 4
     eval_interval: int = 20
     grad_clip_norm: float = 1.0
-    init_checkpoint: Optional[str] = None  # PPO: warm-start from a Stage A (reinforce) checkpoint
+    init_checkpoint: Optional[str] = None  # warm-start policy weights from this checkpoint (either stage)
+    episode_offset: int = 0  # starting value for the training episode_counter (for continuing a prior run)
+    run_tag: Optional[str] = None  # if set, checkpoints/metrics go under checkpoints/<run_tag>/ instead of checkpoints/
+    gamma: float = 1.0  # PPO return-to-go discount; 1.0 = undiscounted (original behavior)
+    advantage_norm: Literal["bucket", "bucket_step"] = "bucket"  # PPO advantage normalization grouping
 
 
 def rl_label_suffix(cfg: RlTrainConfig) -> str:
@@ -266,12 +270,12 @@ def reinforce_update(
 # ---------------------------------------------------------------------------
 # 6. PPO update (Stage B)
 # ---------------------------------------------------------------------------
-def _returns_to_go(rewards: List[float], device: torch.device) -> torch.Tensor:
-    """Undiscounted (gamma=1) return-to-go over a fixed-length episode."""
+def _returns_to_go(rewards: List[float], device: torch.device, gamma: float = 1.0) -> torch.Tensor:
+    """Return-to-go over a fixed-length episode; gamma=1.0 reproduces the original undiscounted sum."""
     out = torch.zeros(len(rewards), device=device, dtype=torch.float32)
     acc = 0.0
     for t in range(len(rewards) - 1, -1, -1):
-        acc += rewards[t]
+        acc = rewards[t] + gamma * acc
         out[t] = acc
     return out
 
@@ -288,6 +292,8 @@ def ppo_update(
     entropy_coef: float,
     ppo_epochs: int,
     grad_clip_norm: float,
+    gamma: float = 1.0,
+    advantage_norm: str = "bucket",
 ) -> Dict[str, float]:
     all_feats = torch.stack([f for ep in episodes for f in ep["feats"]]).to(device)  # (M,6,H,W)
     all_masks = torch.stack([m for ep in episodes for m in ep["masks"]]).to(device)  # (M,Nc)
@@ -298,13 +304,38 @@ def ppo_update(
 
     returns_list: List[torch.Tensor] = []
     bucket_ids: List[int] = []
+    step_ids: List[int] = []
     bucket_to_id = {b: i for i, b in enumerate(sorted({ep["bucket"] for ep in episodes}))}
     for ep in episodes:
-        r2g = _returns_to_go(ep["rewards"], device)
+        r2g = _returns_to_go(ep["rewards"], device, gamma=gamma)
         returns_list.append(r2g)
         bucket_ids.extend([bucket_to_id[ep["bucket"]]] * len(ep["rewards"]))
+        step_ids.extend(range(len(ep["rewards"])))
     all_returns = torch.cat(returns_list).detach()
     all_bucket_ids = torch.tensor(bucket_ids, device=device, dtype=torch.long)
+    all_step_ids = torch.tensor(step_ids, device=device, dtype=torch.long)
+
+    # Advantage is computed ONCE per batch, from the critic as it stood before any of the
+    # ppo_epochs passes below ran, then reused unchanged across all of them -- canonical PPO.
+    # Recomputing it fresh every epoch (as this used to do) let it drift mid-batch as
+    # value_model was updated by the previous epoch's step, so the policy surrogate was
+    # chasing a moving target instead of optimizing against a fixed advantage estimate.
+    with torch.no_grad():
+        values_before = value_model(all_feats)
+    advantage = (all_returns - values_before).clone()
+    if advantage_norm == "bucket_step":
+        # Condition the normalization on (bucket, step) jointly, mirroring Stage A's
+        # per-(bucket, step) baseline -- nets out "how many steps remain" (R_t's dominant
+        # driver under an undiscounted sum) instead of lumping every step index together.
+        group_ids = all_bucket_ids * 1_000_000 + all_step_ids
+    else:
+        group_ids = all_bucket_ids
+    for g in group_ids.unique():
+        sel = group_ids == g
+        mu = advantage[sel].mean()
+        sd = advantage[sel].std(unbiased=False).clamp(min=1e-6)
+        advantage[sel] = (advantage[sel] - mu) / sd
+    advantage = advantage.detach()
 
     metrics: Dict[str, float] = {}
     for _epoch in range(ppo_epochs):
@@ -314,14 +345,7 @@ def ppo_update(
         dist = torch.distributions.Categorical(logits=logits)
         new_log_probs = dist.log_prob(all_actions)
         entropy = dist.entropy()
-        values = value_model(all_feats)
-
-        advantage = (all_returns - values.detach()).clone()
-        for b in all_bucket_ids.unique():
-            sel = all_bucket_ids == b
-            mu = advantage[sel].mean()
-            sd = advantage[sel].std(unbiased=False).clamp(min=1e-6)
-            advantage[sel] = (advantage[sel] - mu) / sd
+        values = value_model(all_feats)  # fresh forward each epoch, only used for value_loss below
 
         ratio = torch.exp(new_log_probs - old_log_probs)
         surr1 = ratio * advantage
@@ -499,6 +523,10 @@ def train_reinforce(cfg: RlTrainConfig) -> None:
     assert cfg.stage == "reinforce"
 
     model, arch_kwargs = _init_model(cfg, device)
+    if cfg.init_checkpoint is not None:
+        init_model = load_rl_checkpoint(Path(cfg.init_checkpoint), device)
+        model.load_state_dict(init_model.state_dict())
+        print(f"REINFORCE: warm-started policy from {cfg.init_checkpoint}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     grid = make_grid(cfg)
@@ -506,18 +534,20 @@ def train_reinforce(cfg: RlTrainConfig) -> None:
     buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", 0.0)]
 
     suffix = rl_label_suffix(cfg)
-    checkpoint_path = CHECKPOINT_DIR / f"reinforce_bandit{suffix}_best.pt"
-    metrics_path = CHECKPOINT_DIR / f"reinforce_bandit{suffix}_metrics.json"
+    out_dir = (CHECKPOINT_DIR / cfg.run_tag) if cfg.run_tag else CHECKPOINT_DIR
+    checkpoint_path = out_dir / f"reinforce_bandit{suffix}_best.pt"
+    metrics_path = out_dir / f"reinforce_bandit{suffix}_metrics.json"
 
     print(
         f"train (reinforce): device={device}, domain={cfg.domain}, buckets={len(buckets)}, "
-        f"episodes_per_update={cfg.episodes_per_update}, n_updates={cfg.n_updates}"
+        f"episodes_per_update={cfg.episodes_per_update}, n_updates={cfg.n_updates}, "
+        f"episode_offset={cfg.episode_offset}, run_tag={cfg.run_tag}"
     )
 
     best_metric = float("inf")
     best_update = -1
     metrics: List[Dict[str, Any]] = []
-    episode_counter = 0
+    episode_counter = cfg.episode_offset
 
     for update in range(1, cfg.n_updates + 1):
         t0 = time.perf_counter()
@@ -603,19 +633,21 @@ def train_ppo(cfg: RlTrainConfig) -> None:
     buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", 0.0)]
 
     suffix = rl_label_suffix(cfg)
-    checkpoint_path = CHECKPOINT_DIR / f"ppo_trajectory{suffix}_best.pt"
-    metrics_path = CHECKPOINT_DIR / f"ppo_trajectory{suffix}_metrics.json"
+    out_dir = (CHECKPOINT_DIR / cfg.run_tag) if cfg.run_tag else CHECKPOINT_DIR
+    checkpoint_path = out_dir / f"ppo_trajectory{suffix}_best.pt"
+    metrics_path = out_dir / f"ppo_trajectory{suffix}_metrics.json"
 
     print(
         f"train (ppo): device={device}, domain={cfg.domain}, buckets={len(buckets)}, "
         f"episodes_per_update={cfg.episodes_per_update}, n_updates={cfg.n_updates}, "
-        f"ppo_epochs={cfg.ppo_epochs}"
+        f"ppo_epochs={cfg.ppo_epochs}, episode_offset={cfg.episode_offset}, run_tag={cfg.run_tag}, "
+        f"gamma={cfg.gamma}, advantage_norm={cfg.advantage_norm}"
     )
 
     best_metric = float("inf")
     best_update = -1
     metrics: List[Dict[str, Any]] = []
-    episode_counter = 0
+    episode_counter = cfg.episode_offset
 
     for update in range(1, cfg.n_updates + 1):
         t0 = time.perf_counter()
@@ -644,6 +676,7 @@ def train_ppo(cfg: RlTrainConfig) -> None:
             model, value_model, optimizer, episodes, device=device,
             clip_eps=cfg.clip_eps, value_coef=cfg.value_coef, entropy_coef=cfg.entropy_coef,
             ppo_epochs=cfg.ppo_epochs, grad_clip_norm=cfg.grad_clip_norm,
+            gamma=cfg.gamma, advantage_norm=cfg.advantage_norm,
         )
         elapsed = time.perf_counter() - t0
 
@@ -699,7 +732,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-epochs", type=int, default=None)
     parser.add_argument("--eval-interval", type=int, default=None)
     parser.add_argument("--real-eval-n-mc", type=int, default=None)
-    parser.add_argument("--init-checkpoint", type=str, default=None, help="ppo stage: warm-start from this reinforce checkpoint.")
+    parser.add_argument("--init-checkpoint", type=str, default=None, help="warm-start policy weights from this checkpoint (either stage).")
+    parser.add_argument("--episode-offset", type=int, default=None, help="starting value for the training episode_counter (continuing a prior run).")
+    parser.add_argument("--run-tag", type=str, default=None, help="if set, write checkpoints/metrics under checkpoints/<run_tag>/ instead of checkpoints/.")
+    parser.add_argument("--gamma", type=float, default=None, help="PPO return-to-go discount (default 1.0 = undiscounted).")
+    parser.add_argument("--advantage-norm", choices=("bucket", "bucket_step"), default=None, help="PPO advantage normalization grouping (default: bucket).")
     parser.add_argument(
         "--domain", choices=("antenna_snapshot", "time_freq"), default=None,
         help="Must match the CNN checkpoint's domain for a fair comparison.",
@@ -749,6 +786,14 @@ def main() -> None:
         cfg.real_eval_n_mc = args.real_eval_n_mc
     if args.init_checkpoint is not None:
         cfg.init_checkpoint = args.init_checkpoint
+    if args.episode_offset is not None:
+        cfg.episode_offset = args.episode_offset
+    if args.run_tag is not None:
+        cfg.run_tag = args.run_tag
+    if args.gamma is not None:
+        cfg.gamma = args.gamma
+    if args.advantage_norm is not None:
+        cfg.advantage_norm = args.advantage_norm
     if args.kernel_hw is not None:
         cfg.kernel_hw = tuple(args.kernel_hw)
     if args.use_global_context:
