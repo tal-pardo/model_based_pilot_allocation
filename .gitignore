@@ -12,3 +12,5 @@ tests/
 *.json
 *.png
 proposal/
+report_latex/
+*.pptx

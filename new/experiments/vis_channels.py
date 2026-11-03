@@ -17,6 +17,8 @@ if str(_NEW_ROOT) not in sys.path:
 from channel_generators.gaussian import build_sigma_kron, sample_gaussian_h
 from channel_generators.sionna import (
     SionnaOFDMGrid,
+    sample_cdl_channel,
+    sample_system_level_channel,
     sample_tdl_a_channel,
     sample_tdl_a_time_freq_channel,
     sample_tdl_c_channel,
@@ -26,15 +28,28 @@ from config import SimConfig
 from utils import resolve_device, set_seed
 
 TDL_SEED_OFFSET = 100_000
+CDL_SEED_OFFSET = 300_000
+SYSTEM_LEVEL_SEED_OFFSET = 500_000
+
+CDL_MODELS: tuple[str, ...] = ("A", "B", "C", "D", "E")
+SYSTEM_LEVEL_SCENARIOS: tuple[str, ...] = ("uma", "umi", "rma")
 
 CHANNEL_ALIASES: dict[str, str] = {
     "tdl": "tdl_a",
+    "cdl": "cdl_a",
 }
 
 CHANNEL_TITLES: dict[str, str] = {
     "gaussian": "Gaussian (Kronecker prior draw)",
     "tdl_a": "TDL-A (Sionna, power-normalized)",
     "tdl_c": "TDL-C (Sionna, power-normalized)",
+    **{
+        f"cdl_{m.lower()}": f"CDL-{m} (Sionna, power-normalized)"
+        for m in CDL_MODELS
+    },
+    "uma": "UMa (Sionna, per-UT topology, power-normalized)",
+    "umi": "UMi (Sionna, per-UT topology, power-normalized)",
+    "rma": "RMa (Sionna, per-UT topology, power-normalized)",
 }
 
 
@@ -45,6 +60,8 @@ class ChannelVisConfig(SimConfig):
     out_dir: Path = _NEW_ROOT / "figures"
     n_symbols: int = 16
     speed: float = 30.0
+    delay_spread: float = 300e-9
+    subcarrier_spacing: float = 15e3
 
 
 def h_mat_from_vec(h: torch.Tensor, n_antennas: int, n_subcarriers: int) -> torch.Tensor:
@@ -103,6 +120,49 @@ def _sample_tdl_realizations(
         )
         channels.append(h_mat)
     return channels
+
+
+def _sample_cdl_realizations(
+    cfg: ChannelVisConfig,
+    *,
+    device: torch.device,
+    grid: SionnaOFDMGrid,
+    model: str,
+) -> list[torch.Tensor]:
+    channels: list[torch.Tensor] = []
+    for mc in range(cfg.n_realizations):
+        h_mat = sample_cdl_channel(
+            model=model,
+            n_antennas=cfg.n_antennas,
+            n_subcarriers=cfg.n_subcarriers,
+            grid=grid,
+            device=device,
+            dtype=cfg.dtype,
+            seed=cfg.seed + CDL_SEED_OFFSET + mc,
+        )
+        channels.append(h_mat)
+    return channels
+
+
+def _sample_system_level_realizations(
+    cfg: ChannelVisConfig,
+    *,
+    device: torch.device,
+    grid: SionnaOFDMGrid,
+    scenario: str,
+) -> list[torch.Tensor]:
+    """One batched topology draw (n_realizations independent UTs) -- each UT gets its
+    own randomly dropped position/orientation, hence its own per-draw cluster geometry."""
+    return sample_system_level_channel(
+        scenario=scenario,
+        n_antennas=cfg.n_antennas,
+        n_subcarriers=cfg.n_subcarriers,
+        n_realizations=cfg.n_realizations,
+        grid=grid,
+        device=device,
+        dtype=cfg.dtype,
+        seed=cfg.seed + SYSTEM_LEVEL_SEED_OFFSET,
+    )
 
 
 TIME_FREQ_SAMPLERS: dict[str, Callable[..., torch.Tensor]] = {
@@ -168,9 +228,20 @@ def sample_channel_realizations(
         if grid is None:
             raise ValueError("TDL sampling requires grid.")
         return _sample_tdl_realizations(cfg, device=device, grid=grid, sampler=sample_tdl_c_channel)
+    if channel.startswith("cdl_"):
+        if grid is None:
+            raise ValueError("CDL sampling requires grid.")
+        model = channel.removeprefix("cdl_").upper()
+        if model not in CDL_MODELS:
+            raise ValueError(f"Unknown CDL model {model!r}. Choose from: {', '.join(CDL_MODELS)}.")
+        return _sample_cdl_realizations(cfg, device=device, grid=grid, model=model)
+    if channel in SYSTEM_LEVEL_SCENARIOS:
+        if grid is None:
+            raise ValueError("System-level sampling requires grid.")
+        return _sample_system_level_realizations(cfg, device=device, grid=grid, scenario=channel)
     raise ValueError(
         f"Unknown channel type {channel!r}. Choose from: {', '.join(list_channel_types())} "
-        f"(alias: tdl -> tdl_a)."
+        f"(aliases: tdl -> tdl_a, cdl -> cdl_a)."
     )
 
 
@@ -305,8 +376,21 @@ def visualize_channel(
         na, nc = cfg.n_antennas, cfg.n_subcarriers
         if channel == "gaussian":
             subtitle = f"Na={na}, Nc={nc}, rho_space={cfg.rho_space}, rho_freq={cfg.rho_freq}"
+        elif channel.startswith("cdl_"):
+            subtitle = (
+                f"Na={na}, Nc={nc}, delay_spread={cfg.delay_spread * 1e9:.0f}ns, "
+                f"scs={cfg.subcarrier_spacing / 1e3:.0f}kHz"
+            )
+        elif channel in SYSTEM_LEVEL_SCENARIOS:
+            subtitle = (
+                f"Na={na}, Nc={nc}, scs={cfg.subcarrier_spacing / 1e3:.0f}kHz, "
+                f"one independently-dropped UT per realization (random LSPs/angles)"
+            )
         else:
-            subtitle = f"Na={na}, Nc={nc}, rho_space={cfg.rho_space}"
+            subtitle = (
+                f"Na={na}, Nc={nc}, rho_space={cfg.rho_space}, "
+                f"delay_spread={cfg.delay_spread * 1e9:.0f}ns, scs={cfg.subcarrier_spacing / 1e3:.0f}kHz"
+            )
         out_path = cfg.out_dir / f"{channel}_vis.png"
 
     plot_domain_panels(
@@ -325,20 +409,23 @@ def run_vis(cfg: ChannelVisConfig, channels: list[str], *, domain: str = "space-
     if cfg.dtype not in (torch.complex64, torch.complex128):
         raise ValueError("Use a complex dtype (torch.complex64/128).")
 
-    _, l_space, l_freq = build_sigma_kron(
-        cfg.n_antennas,
-        cfg.n_subcarriers,
-        cfg.rho_space,
-        cfg.rho_freq,
-        device=device,
-        dtype=cfg.dtype,
-        reg=cfg.reg_kron,
-    )
+    l_space: torch.Tensor | None = None
+    l_freq: torch.Tensor | None = None
+    if "gaussian" in channels:
+        _, l_space, l_freq = build_sigma_kron(
+            cfg.n_antennas,
+            cfg.n_subcarriers,
+            cfg.rho_space,
+            cfg.rho_freq,
+            device=device,
+            dtype=cfg.dtype,
+            reg=cfg.reg_kron,
+        )
     grid = SionnaOFDMGrid(
         fft_size=cfg.n_subcarriers,
-        subcarrier_spacing=15e3,
+        subcarrier_spacing=cfg.subcarrier_spacing,
         carrier_frequency=3.5e9,
-        delay_spread=300e-9,
+        delay_spread=cfg.delay_spread,
     )
 
     out_paths: list[Path] = []
@@ -367,7 +454,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument(
         "--channel",
         type=str,
-        help=f"Channel type: {', '.join(list_channel_types())} (alias: tdl -> tdl_a)",
+        help=f"Channel type: {', '.join(list_channel_types())} (aliases: tdl -> tdl_a, cdl -> cdl_a)",
     )
     g.add_argument("--all", action="store_true", help="Generate figures for all supported channel types.")
     p.add_argument("--n-antennas", type=int, default=None)
@@ -378,6 +465,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--reg-kron", type=float, default=None, help="Ridge on Kronecker Sigma (default 1e-9).")
+    p.add_argument(
+        "--delay-spread",
+        type=float,
+        default=None,
+        help="Delay spread in seconds for TDL/CDL grid (default 300e-9).",
+    )
+    p.add_argument(
+        "--subcarrier-spacing",
+        type=float,
+        default=None,
+        help="Subcarrier spacing in Hz for TDL/CDL grid (default 15e3; exp10 uses 120e3).",
+    )
     p.add_argument("--out-dir", type=Path, default=None, help="Output directory (default new/figures/).")
     p.add_argument(
         "--domain",
@@ -431,6 +530,10 @@ def main() -> None:
         cfg.device = args.device
     if args.reg_kron is not None:
         cfg.reg_kron = args.reg_kron
+    if args.delay_spread is not None:
+        cfg.delay_spread = args.delay_spread
+    if args.subcarrier_spacing is not None:
+        cfg.subcarrier_spacing = args.subcarrier_spacing
     if args.out_dir is not None:
         cfg.out_dir = args.out_dir
     if args.n_symbols is not None:

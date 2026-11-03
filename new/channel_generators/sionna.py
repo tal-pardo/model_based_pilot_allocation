@@ -7,8 +7,13 @@ from typing import Optional
 import torch
 
 from sionna.phy import config as sionna_config
-from sionna.phy.channel import cir_to_ofdm_channel, exp_corr_mat, subcarrier_frequencies
-from sionna.phy.channel.tr38901 import AntennaArray, CDL, TDL
+from sionna.phy.channel import (
+    cir_to_ofdm_channel,
+    exp_corr_mat,
+    gen_single_sector_topology,
+    subcarrier_frequencies,
+)
+from sionna.phy.channel.tr38901 import AntennaArray, CDL, PanelArray, RMa, TDL, UMa, UMi
 
 from utils import empirical_covariance
 
@@ -275,6 +280,74 @@ def sample_cdl_c_channel(
         dtype=dtype,
         seed=seed,
     )
+
+
+SYSTEM_LEVEL_MODELS = {"uma": UMa, "umi": UMi, "rma": RMa}
+
+
+def sample_system_level_channel(
+    *,
+    scenario: str,
+    n_antennas: int,
+    n_subcarriers: int,
+    n_realizations: int,
+    grid: SionnaOFDMGrid,
+    device: torch.device,
+    dtype: torch.dtype = torch.complex64,
+    seed: Optional[int] = None,
+) -> list[torch.Tensor]:
+    """Input: scenario ('uma'/'umi'/'rma'), Na, Nc, number of independent UT drops, grid, device.
+    Unlike CDL/TDL (fixed per-model cluster table), the 3GPP system-level models draw
+    per-UT large/small-scale parameters (incl. cluster AoD/AoA/ZoD/ZoA) from `gen_single_sector_topology`
+    -- one UT per realization, single BS sector, uplink. Output: list of `n_realizations` H (Na,Nc)."""
+    if scenario not in SYSTEM_LEVEL_MODELS:
+        raise ValueError(f"Unknown system-level scenario {scenario!r}. Choose from: {', '.join(SYSTEM_LEVEL_MODELS)}.")
+    if seed is not None:
+        _set_torch_seed(seed, device)
+    sionna_device = _sionna_device(device)
+    bs_array = PanelArray(
+        num_rows_per_panel=1,
+        num_cols_per_panel=n_antennas,
+        polarization="single",
+        polarization_type="V",
+        antenna_pattern="omni",
+        carrier_frequency=grid.carrier_frequency,
+    )
+    ut_array = PanelArray(
+        num_rows_per_panel=1,
+        num_cols_per_panel=1,
+        polarization="single",
+        polarization_type="V",
+        antenna_pattern="omni",
+        carrier_frequency=grid.carrier_frequency,
+    )
+    model_kwargs: dict = {
+        "carrier_frequency": grid.carrier_frequency,
+        "ut_array": ut_array,
+        "bs_array": bs_array,
+        "direction": "uplink",
+        "device": sionna_device,
+    }
+    if scenario != "rma":
+        model_kwargs["o2i_model"] = "low"
+    channel_model = SYSTEM_LEVEL_MODELS[scenario](**model_kwargs)
+
+    ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state = gen_single_sector_topology(
+        batch_size=1,
+        num_ut=n_realizations,
+        scenario=scenario,
+        device=sionna_device,
+    )
+    channel_model.set_topology(ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state)
+
+    a, tau = channel_model(num_time_samples=1, sampling_frequency=grid.bandwidth)
+    frequencies = subcarrier_frequencies(grid.fft_size, grid.subcarrier_spacing, device=sionna_device)
+    h_freq = cir_to_ofdm_channel(frequencies, a, tau, normalize=True)
+    channels: list[torch.Tensor] = []
+    for idx in range(n_realizations):
+        h = h_freq[0, 0, :n_antennas, idx, 0, 0, :n_subcarriers]
+        channels.append(_normalize_channel_power(h).to(device=device, dtype=dtype))
+    return channels
 
 
 def vec_from_h(h: torch.Tensor) -> torch.Tensor:
