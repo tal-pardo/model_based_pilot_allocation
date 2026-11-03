@@ -8,7 +8,7 @@ Sections:
   4. block_error_labels
   5. CNNErrorEstimator
   6. masked_huber_loss
-  7. estimate_sigma (estimate_empirical_sigma_tdl_a)
+  7. estimate_sigma (load_empirical_sigma / load_sigma_buckets)
   8. collect_snapshots_one_channel
   9. build_dataset_cache
   10. train_loop
@@ -47,8 +47,6 @@ from channel_estimators.cov_update import ledoit_wolf_shrinkage
 from channel_estimators.lmmse import EstimatorState, lmmse_incremental_update, lmmse_initial_update
 from channel_generators.sionna import (
     SionnaOFDMGrid,
-    estimate_empirical_sigma_tdl_a,
-    sample_tdl_a_channel,
     sample_tdl_ofdm_channel,
     vec_from_h,
 )
@@ -57,7 +55,7 @@ from experiments.common import full_subcarrier_batch_true_mse, make_policy
 from pilot_policy.base import PilotPolicy, initial_subcarriers_uniform
 from pilot_policy.dmrs_comb import DmrsCombPolicy
 from simulation import run_until_threshold
-from utils import complex_standard_normal, measure_subcarrier, resolve_device
+from utils import complex_standard_normal, empirical_covariance, measure_subcarrier, resolve_device
 
 LABEL_EPS = 1e-8
 NUM_FEATURE_CHANNELS = 6
@@ -153,6 +151,16 @@ class CnnTrainConfig:
     # scale varies ~15x across time_freq's 9 buckets, which the deployment decision never needs
     # to resolve, only the within-sample ranking).
     loss_type: Literal["huber", "ranking_ce"] = "huber"
+    # antenna_snapshot only (no-op under "time_freq", which has its own tdl_models/speeds
+    # buckets): UE speed (m/s) passed to the TDL-A sampler. Default 0.0 preserves exact prior
+    # behavior -- with n_ofdm_symbols=1 (a single snapshot), Doppler/speed has no guaranteed
+    # observable effect on the resulting antenna x subcarrier draw (Doppler only manifests as
+    # phase evolution across time samples), but it's exposed for parity/metadata on request.
+    antenna_speed: float = 0.0
+    # Optional extra suffix appended to label_suffix()'s cache/checkpoint/figure names, so a
+    # variant run (e.g. a non-default antenna_speed) never collides with the default-named
+    # artifacts for the same domain/label_mode.
+    variant_tag: Optional[str] = None
 
     @property
     def n_total(self) -> int:
@@ -310,10 +318,12 @@ def block_error_labels(
 
 def label_suffix(cfg: "CnnTrainConfig") -> str:
     """Input: config. Output: '_tf' for domain='time_freq', then '_cf' for counterfactual
-    label mode (either, both, or neither)."""
+    label mode (either, both, or neither), then '_<variant_tag>' if set."""
     suffix = "_tf" if cfg.domain == "time_freq" else ""
     if cfg.label_mode == "counterfactual":
         suffix += "_cf"
+    if cfg.variant_tag:
+        suffix += f"_{cfg.variant_tag}"
     return suffix
 
 
@@ -585,24 +595,32 @@ def make_grid(cfg: CnnTrainConfig) -> SionnaOFDMGrid:
 
 
 def load_empirical_sigma(cfg: CnnTrainConfig, device: torch.device, *, n_cov_mc: int | None = None) -> torch.Tensor:
-    """Input: config, device. Output: (N,N) empirical Sigma from TDL-A."""
+    """Input: config, device. Output: (N,N) empirical Sigma from TDL-A at cfg.antenna_speed
+    (0.0 by default, matching sample_tdl_a_channel's hardcoded speed exactly)."""
     grid = make_grid(cfg)
     n_mc = n_cov_mc if n_cov_mc is not None else cfg.n_cov_mc
     t0 = time.perf_counter()
-    sigma = estimate_empirical_sigma_tdl_a(
-        n_antennas=cfg.n_antennas,
-        n_subcarriers=cfg.n_subcarriers,
-        rho_space=cfg.rho_space,
-        n_cov_mc=n_mc,
-        seed=cfg.seed,
-        seed_offset=SIGMA_BUCKET_OFFSET,
-        reg_empirical=cfg.reg_empirical,
-        grid=grid,
-        device=device,
-        dtype=cfg.dtype,
-    )
+    samples = torch.zeros((n_mc, cfg.n_total), device=device, dtype=cfg.dtype)
+    for k in range(n_mc):
+        h_mat = sample_tdl_ofdm_channel(
+            model="A",
+            n_ofdm_symbols=1,
+            n_subcarriers=cfg.n_subcarriers,
+            grid=grid,
+            device=device,
+            n_antennas=cfg.n_antennas,
+            rho_space=cfg.rho_space,
+            speed=cfg.antenna_speed,
+            dtype=cfg.dtype,
+            seed=cfg.seed + SIGMA_BUCKET_OFFSET + k,
+        )
+        samples[k] = vec_from_h(h_mat).squeeze(-1)
+    sigma = empirical_covariance(samples, reg=cfg.reg_empirical, device=device, dtype=cfg.dtype)
     elapsed = time.perf_counter() - t0
-    print(f"Empirical Sigma: n_cov_mc={n_mc}, seed_offset={SIGMA_BUCKET_OFFSET}, elapsed={elapsed:.1f}s")
+    print(
+        f"Empirical Sigma: n_cov_mc={n_mc}, seed_offset={SIGMA_BUCKET_OFFSET}, "
+        f"antenna_speed={cfg.antenna_speed:g}, elapsed={elapsed:.1f}s"
+    )
     return sigma
 
 
@@ -626,7 +644,7 @@ def load_sigma_buckets(cfg: CnnTrainConfig, device: torch.device) -> Dict[Tuple[
     scheme) would be statistically mismatched for every channel whose true (model,speed)
     second-order statistics differ from whatever single setting it was estimated under."""
     if cfg.domain != "time_freq":
-        return {("A", 0.0): load_empirical_sigma(cfg, device)}
+        return {("A", cfg.antenna_speed): load_empirical_sigma(cfg, device)}
 
     grid = make_grid(cfg)
     buckets = tdl_buckets(cfg)
@@ -696,12 +714,15 @@ def sample_tdl_channel(
             seed=cfg.seed + TDL_CHANNEL_OFFSET + channel_mc,
         )
         return vec_from_h(h_tf)
-    h_mat = sample_tdl_a_channel(
-        n_antennas=cfg.n_antennas,
+    h_mat = sample_tdl_ofdm_channel(
+        model="A",
+        n_ofdm_symbols=1,
         n_subcarriers=cfg.n_subcarriers,
-        rho_space=cfg.rho_space,
         grid=grid,
         device=device,
+        n_antennas=cfg.n_antennas,
+        rho_space=cfg.rho_space,
+        speed=cfg.antenna_speed,
         dtype=cfg.dtype,
         seed=cfg.seed + TDL_CHANNEL_OFFSET + channel_mc,
     )
@@ -748,7 +769,7 @@ def collect_snapshots_one_channel(
     n = cfg.n_total
     grid_na, grid_nc = feature_grid_shape(cfg)
     zscore_mode = zscore_mode_for(cfg)
-    bucket = bucket_for_channel(cfg, channel_mc) if cfg.domain == "time_freq" else ("A", 0.0)
+    bucket = bucket_for_channel(cfg, channel_mc) if cfg.domain == "time_freq" else ("A", cfg.antenna_speed)
     sigma = sigma_by_bucket[bucket]
     policy_name = rollout_policy_name(channel_idx)
     channel_seed = tdl_channel_seed(cfg, channel_mc)
@@ -1350,24 +1371,37 @@ def run_closed_loop_mse_curve(
     return trace.nmse_true
 
 
-def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
+def eval_phase1b(
+    cfg: CnnTrainConfig, *, checkpoint_path: Path, rl_checkpoint_path: Optional[Path] = None
+) -> None:
+    """Passing rl_checkpoint_path adds a 4th 'rl' arm (see
+    error_estimators/rl/train.py::RlPilotPolicy), mirroring eval_phase1b_time_freq."""
     import matplotlib.pyplot as plt
     import numpy as np
 
     device = resolve_device(cfg.device)
     model = load_cnn_checkpoint(checkpoint_path, device)
+    rl_model = None
+    if rl_checkpoint_path is not None:
+        from error_estimators.rl.train import load_rl_checkpoint  # local: avoids a module-load cycle
+
+        rl_model = load_rl_checkpoint(rl_checkpoint_path, device)
     grid = make_grid(cfg)
     sigma = load_empirical_sigma(cfg, device)
 
-    curves: Dict[str, List[List[float]]] = {"cnn": [], "fixed": [], "active": []}
+    policies: Tuple[str, ...] = ("cnn", "fixed", "active", "rl") if rl_model is not None else ("cnn", "fixed", "active")
+    curves: Dict[str, List[List[float]]] = {name: [] for name in policies}
     h_list: List[torch.Tensor] = []
 
-    print(f"eval phase1b: n_mc={cfg.eval_n_mc}, checkpoint={checkpoint_path}")
+    print(
+        f"eval phase1b: n_mc={cfg.eval_n_mc}, checkpoint={checkpoint_path}, "
+        f"rl_checkpoint={rl_checkpoint_path}"
+    )
     for mc in range(cfg.eval_n_mc):
         channel_mc = EVAL_CHANNEL_OFFSET + mc
         h_true = sample_tdl_channel(cfg, channel_mc=channel_mc, device=device, grid=grid)
         h_list.append(h_true)
-        for policy in ("cnn", "fixed", "active"):
+        for policy in policies:
             curve = run_closed_loop_mse_curve(
                 cfg,
                 h_true=h_true,
@@ -1376,6 +1410,7 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
                 channel_mc=channel_mc,
                 policy_mode=policy,
                 cnn_model=model if policy == "cnn" else None,
+                rl_model=rl_model if policy == "rl" else None,
             )
             curves[policy].append(curve)
 
@@ -1414,6 +1449,7 @@ def eval_phase1b(cfg: CnnTrainConfig, *, checkpoint_path: Path) -> None:
     payload = {
         "n_mc": cfg.eval_n_mc,
         "checkpoint": str(checkpoint_path),
+        "rl_checkpoint": str(rl_checkpoint_path) if rl_checkpoint_path is not None else None,
         "pilots": pilots.tolist(),
         "curves": {k: v.tolist() for k, v in mean_curves.items()},
         "full_lmmse_mse": full_mse,
@@ -1774,6 +1810,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--n-channels", type=int, default=None, help="Override channel count for build smoke tests.")
     parser.add_argument("--n-cov-mc", type=int, default=None, help="Override empirical Sigma MC sample count (default 512).")
+    parser.add_argument(
+        "--antenna-speed", type=float, default=None,
+        help="antenna_snapshot only: UE speed (m/s) passed to the TDL-A sampler (default 0.0).",
+    )
+    parser.add_argument(
+        "--variant-tag", type=str, default=None,
+        help="Extra suffix appended to cache/checkpoint/figure names so a variant run "
+        "(e.g. a non-default --antenna-speed) doesn't collide with the default artifacts.",
+    )
     parser.add_argument("--force-regen", action="store_true")
     parser.add_argument(
         "--label-mode",
@@ -1846,7 +1891,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rl-checkpoint", type=str, default=None,
-        help="--phase eval, --domain time_freq only: path to an error_estimators/rl/train.py "
+        help="--phase eval only (either domain): path to an error_estimators/rl/train.py "
         "checkpoint (e.g. ppo_trajectory_tf_best.pt) to add a 4th 'rl' arm to the comparison.",
     )
     return parser.parse_args()
@@ -1865,6 +1910,10 @@ def main() -> None:
         cfg.max_epochs = args.max_epochs
     if args.n_cov_mc is not None:
         cfg.n_cov_mc = args.n_cov_mc
+    if args.antenna_speed is not None:
+        cfg.antenna_speed = args.antenna_speed
+    if args.variant_tag is not None:
+        cfg.variant_tag = args.variant_tag
     if args.label_mode is not None:
         cfg.label_mode = args.label_mode
     if args.train_channels is not None:
@@ -1946,14 +1995,17 @@ def main() -> None:
         return
 
     if args.phase == "eval":
+        rl_checkpoint_path = Path(args.rl_checkpoint) if args.rl_checkpoint is not None else None
         if cfg.domain == "time_freq":
-            rl_checkpoint_path = Path(args.rl_checkpoint) if args.rl_checkpoint is not None else None
             eval_phase1b_time_freq(
                 cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt",
                 rl_checkpoint_path=rl_checkpoint_path,
             )
         else:
-            eval_phase1b(cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt")
+            eval_phase1b(
+                cfg, checkpoint_path=CHECKPOINT_DIR / f"phase1{suffix}_best.pt",
+                rl_checkpoint_path=rl_checkpoint_path,
+            )
         return
 
     if args.phase == "build-finetune":

@@ -214,7 +214,7 @@ def rollout_episode(
 
 
 def _sample_bucket_channel(cfg: RlTrainConfig, channel_mc: int) -> Tuple[str, float]:
-    return bucket_for_channel(cfg, channel_mc) if cfg.domain == "time_freq" else ("A", 0.0)
+    return bucket_for_channel(cfg, channel_mc) if cfg.domain == "time_freq" else ("A", cfg.antenna_speed)
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +531,7 @@ def train_reinforce(cfg: RlTrainConfig) -> None:
 
     grid = make_grid(cfg)
     sigma_by_bucket = load_sigma_buckets(cfg, device)
-    buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", 0.0)]
+    buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", cfg.antenna_speed)]
 
     suffix = rl_label_suffix(cfg)
     out_dir = (CHECKPOINT_DIR / cfg.run_tag) if cfg.run_tag else CHECKPOINT_DIR
@@ -630,7 +630,7 @@ def train_ppo(cfg: RlTrainConfig) -> None:
 
     grid = make_grid(cfg)
     sigma_by_bucket = load_sigma_buckets(cfg, device)
-    buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", 0.0)]
+    buckets = tdl_buckets(cfg) if cfg.domain == "time_freq" else [("A", cfg.antenna_speed)]
 
     suffix = rl_label_suffix(cfg)
     out_dir = (CHECKPOINT_DIR / cfg.run_tag) if cfg.run_tag else CHECKPOINT_DIR
@@ -753,6 +753,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-global-context", action="store_true", default=False)
     parser.add_argument("--max-pilots", type=int, default=None)
     parser.add_argument("--sigma2", type=float, default=None)
+    parser.add_argument(
+        "--antenna-speed", type=float, default=None,
+        help="antenna_snapshot only: UE speed (m/s) passed to the TDL-A sampler (default 0.0).",
+    )
     return parser.parse_args()
 
 
@@ -812,6 +816,8 @@ def main() -> None:
         cfg.max_pilots = args.max_pilots
     if args.sigma2 is not None:
         cfg.sigma2 = args.sigma2
+    if args.antenna_speed is not None:
+        cfg.antenna_speed = args.antenna_speed
     if args.domain is not None:
         cfg.domain = args.domain
     if cfg.domain == "time_freq":
