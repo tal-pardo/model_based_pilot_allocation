@@ -476,9 +476,13 @@ def model_arch_kwargs(cfg: "CnnTrainConfig") -> Dict[str, Any]:
             "kernel_hw": cfg.kernel_hw if cfg.kernel_hw is not None else (3, 3),
             "use_global_context": cfg.use_global_context,
         }
+    # antenna_snapshot with n_antennas=1 (SISO frequency-only variant): there is no antenna
+    # row axis to convolve over, so a height>1 kernel would only ever see zero-padding on its
+    # extra rows. Default to a height-1 kernel in that case; na>1 keeps the original (3,5).
+    default_kernel_hw = (1, 5) if cfg.n_antennas == 1 else (3, 5)
     return {
         "pool_mode": "mean",
-        "kernel_hw": cfg.kernel_hw if cfg.kernel_hw is not None else (3, 5),
+        "kernel_hw": cfg.kernel_hw if cfg.kernel_hw is not None else default_kernel_hw,
         "use_global_context": cfg.use_global_context,
     }
 
@@ -1811,6 +1815,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-channels", type=int, default=None, help="Override channel count for build smoke tests.")
     parser.add_argument("--n-cov-mc", type=int, default=None, help="Override empirical Sigma MC sample count (default 512).")
     parser.add_argument(
+        "--n-antennas", type=int, default=None,
+        help="antenna_snapshot only (time_freq forces this to 1): number of antennas (default 16). "
+        "Set to 1 for a SISO frequency-only channel (no antenna axis).",
+    )
+    parser.add_argument(
+        "--n-subcarriers", type=int, default=None,
+        help="antenna_snapshot only (time_freq forces this to n_symbols*n_freq_subcarriers): "
+        "number of frequency subcarriers (default 32).",
+    )
+    parser.add_argument("--max-pilots", type=int, default=None, help="Rollout length / pilot budget (default 32).")
+    parser.add_argument(
         "--antenna-speed", type=float, default=None,
         help="antenna_snapshot only: UE speed (m/s) passed to the TDL-A sampler (default 0.0).",
     )
@@ -1910,6 +1925,12 @@ def main() -> None:
         cfg.max_epochs = args.max_epochs
     if args.n_cov_mc is not None:
         cfg.n_cov_mc = args.n_cov_mc
+    if args.n_antennas is not None:
+        cfg.n_antennas = args.n_antennas
+    if args.n_subcarriers is not None:
+        cfg.n_subcarriers = args.n_subcarriers
+    if args.max_pilots is not None:
+        cfg.max_pilots = args.max_pilots
     if args.antenna_speed is not None:
         cfg.antenna_speed = args.antenna_speed
     if args.variant_tag is not None:

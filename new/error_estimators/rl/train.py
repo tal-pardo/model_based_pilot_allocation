@@ -757,6 +757,16 @@ def parse_args() -> argparse.Namespace:
         "--antenna-speed", type=float, default=None,
         help="antenna_snapshot only: UE speed (m/s) passed to the TDL-A sampler (default 0.0).",
     )
+    parser.add_argument(
+        "--n-antennas", type=int, default=None,
+        help="antenna_snapshot only (time_freq forces this to 1): number of antennas (default 16). "
+        "Must match the CNN checkpoint's n_antennas for a fair comparison (e.g. 1 for SISO frequency-only).",
+    )
+    parser.add_argument(
+        "--n-subcarriers", type=int, default=None,
+        help="antenna_snapshot only (time_freq forces this to n_symbols*n_freq_subcarriers): "
+        "number of frequency subcarriers (default 32). Must match the CNN checkpoint's n_subcarriers.",
+    )
     return parser.parse_args()
 
 
@@ -818,6 +828,10 @@ def main() -> None:
         cfg.sigma2 = args.sigma2
     if args.antenna_speed is not None:
         cfg.antenna_speed = args.antenna_speed
+    if args.n_antennas is not None:
+        cfg.n_antennas = args.n_antennas
+    if args.n_subcarriers is not None:
+        cfg.n_subcarriers = args.n_subcarriers
     if args.domain is not None:
         cfg.domain = args.domain
     if cfg.domain == "time_freq":
